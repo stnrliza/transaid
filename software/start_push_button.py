@@ -18,6 +18,11 @@ class PushButtonReader:
             print(f"Failed to connect to {self.port}: {e}")
             self.ser = None
 
+    @property
+    def is_connected(self):
+        """Check if serial connection is active."""
+        return self.ser is not None and self.ser.is_open
+
     def read_push_button_status(self):
         """Membaca status push button dari port serial"""
         if self.ser and self.ser.is_open:
@@ -33,8 +38,7 @@ class PushButtonReader:
                 self.close_connection()
                 return None
         else:
-            print("Serial connection not open")
-            return None
+            return None  # Serial not connected, silently return None
 
     def continuously_monitor(self, callback, interval=100):
         """Monitor status push button secara terus-menerus"""

@@ -1,4 +1,3 @@
-import ctypes
 import tkinter as tk
 import customtkinter as ctk
 from pathlib import Path
@@ -9,11 +8,6 @@ ASSETS_PATH = Path(__file__).parent / "assets" / "frame-a"  # needing .parent bc
 def relative_to_assets(path: str) -> Path:
     return ASSETS_PATH / path  # ASSETS_PATH is used to address just the folder ("assets" folder), while this function is used to *address each assets inside frame-a* (e.g. button, image, etc)
 
-# activing DPI Awareness (shortly it's for adjusting the screen to high resolution/high DPI monitor)
-try:
-    ctypes.windll.shcore.SetProcessDpiAwareness(2)
-except Exception as e:
-    print(f"Error setting DPI awareness: {e}")
 
 class TransAIDScreen(tk.Frame): 
     def __init__(self, parent, controller):

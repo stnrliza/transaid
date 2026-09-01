@@ -1,23 +1,18 @@
-import ctypes
 import os
-import ttkbootstrap as tb
+import sqlite3
 import threading
-from pathlib import Path
 import tkinter as tk
-from tkinter import Canvas, PhotoImage
-import time
+from tkinter import Canvas, messagebox
+import customtkinter as ctk
+from pathlib import Path
+from PIL import Image, ImageTk
 from yolov8_segment import run_yolov8_segmentation
 
 ASSETS_PATH = Path(__file__).resolve().parent / "assets" / "frame-d"
+DATABASE_PATH = Path(__file__).resolve().parent / "pasien.db"
 
 def relative_to_assets(path: str) -> Path:
     return ASSETS_PATH / Path(path)
-
-# Mengaktifkan DPI Awareness
-try:
-    ctypes.windll.shcore.SetProcessDpiAwareness(2)
-except Exception as e:
-    print(f"Error setting DPI awareness: {e}")
 
 class LoadingScreen(tk.Frame):
     def __init__(self, parent, controller):
@@ -25,63 +20,154 @@ class LoadingScreen(tk.Frame):
         self.controller = controller
         self.configure(bg="#FFFFFF")
 
-        # Header for the loading screen
-        header_frame = tk.Frame(self, bg="#FFFFFF")
-        header_frame.pack(fill="both", pady=(20, 0))
+        self.image_path = None
+        self.patient_folder = None
+        self.progress_value = 0.0
+        self.segmentation_done = False
+        self.segmentation_error = None
+        self.output_path = None
 
-        # Membuat canvas untuk gambar latar belakang
-        canvas = Canvas(header_frame, bg="#FFFFFF", height=400, width=1920, bd=0, highlightthickness=0, relief="ridge")
-        canvas.pack(fill="x")
-        image_image_1_path = relative_to_assets("d-image.png")
-        if image_image_1_path.exists():
-            image_image_1 = PhotoImage(file=image_image_1_path)
-            canvas.create_image(959, 200, image=image_image_1)
-            canvas.image_image_1 = image_image_1
-        else:
-            print(f"Error: File not found - {image_image_1_path}")
+        # Container
+        self.container = tk.Frame(self, bg="#FFFFFF")
+        self.container.place(relx=0, rely=0, relwidth=1, relheight=1)
 
-        # Text to display processing message
-        message_label = tk.Label(self, text="Sedang Memproses", font=("Poppins Bold", 50), fg="#15218E", bg="#FFFFFF")
-        message_label.pack(pady=50)
+        # Header Image / Logo
+        self.image_label = tk.Label(self.container, bg="#FFFFFF")
+        self.image_label.place(relx=0.5, rely=0.25, anchor="center")
 
-        # Floodgauge (loading bar)
-        style = tb.Style()
-        style.configure("primary.Horizontal.TFloodgauge",
-                        background="#15218E",
-                        troughcolor="#DDDDDD",
-                        lightcolor="#15218E",
-                        darkcolor="#15218E",
-                        bordercolor="#15218E")
+        image_path = relative_to_assets("d-image.png")
+        if image_path.exists():
+            img = Image.open(image_path)
+            # Resize image reasonably
+            img_resized = img.resize((320, 200), Image.LANCZOS)
+            self.header_photo = ImageTk.PhotoImage(img_resized)
+            self.image_label.configure(image=self.header_photo)
 
-        self.my_gauge = tb.Floodgauge(self, bootstyle="primary", font=("Helvetica", 18), mask="{}%",
-                                      maximum=100, orient="horizontal", value=0, mode="determinate")
-        self.my_gauge.pack(pady=(20, 0), fill="x", padx=150)
+        # Title Label
+        self.message_label = ctk.CTkLabel(
+            self.container,
+            text="Sedang Memproses Segmentasi...",
+            font=("Poppins Bold", 32),
+            text_color="#15218E"
+        )
+        self.message_label.place(relx=0.5, rely=0.48, anchor="center")
+
+        # Subtitle / Status text
+        self.status_label = ctk.CTkLabel(
+            self.container,
+            text="Menganalisis karies gigi dengan model AI YOLOv8...",
+            font=("Poppins", 15),
+            text_color="#555555"
+        )
+        self.status_label.place(relx=0.5, rely=0.54, anchor="center")
+
+        # CustomTkinter Progress Bar
+        self.progress_bar = ctk.CTkProgressBar(
+            self.container,
+            width=500,
+            height=20,
+            corner_radius=10,
+            progress_color="#15218E",
+            fg_color="#E0E6ED"
+        )
+        self.progress_bar.place(relx=0.5, rely=0.62, anchor="center")
+        self.progress_bar.set(0.0)
+
+        # Percentage label
+        self.pct_label = ctk.CTkLabel(
+            self.container,
+            text="0%",
+            font=("Poppins Bold", 16),
+            text_color="#15218E"
+        )
+        self.pct_label.place(relx=0.5, rely=0.67, anchor="center")
+
+    def on_show(self):
+        """Reset progress state saat layar ditampilkan."""
+        self.progress_value = 0.0
+        self.segmentation_done = False
+        self.segmentation_error = None
+        self.progress_bar.set(0.0)
+        self.pct_label.configure(text="0%")
+        self.message_label.configure(text="Sedang Memproses Segmentasi...")
+        self.status_label.configure(text="Menganalisis karies gigi dengan model AI YOLOv8...")
 
     def start_segmentation(self, image_path, patient_folder):
         """
-        Starts segmentation and progress bar in parallel using threads.
-        `image_path`: Path to the captured image.
-        `patient_folder`: Folder where both the captured image and the segmented output will be saved.
+        Memulai proses segmentasi di background thread dan animasi progress bar di main thread.
         """
         self.image_path = image_path
-        self.patient_folder = patient_folder  # Patient folder from the input in bbb1.py
+        self.patient_folder = patient_folder
+        self.output_path = str(Path(patient_folder) / "output-segmented.jpg")
+        self.progress_value = 0.0
+        self.segmentation_done = False
+        self.segmentation_error = None
 
-        # Start two threads: one for progress bar and one for segmentation
-        threading.Thread(target=self.update_progress_bar, daemon=True).start()
-        threading.Thread(target=self.run_segmentation, daemon=True).start()
+        # Jalankan background worker untuk inferensi AI
+        worker_thread = threading.Thread(target=self._run_segmentation_worker, daemon=True)
+        worker_thread.start()
 
-    def update_progress_bar(self):
-        """Updates the progress bar as the segmentation happens."""
-        for i in range(101):
-            self.my_gauge.configure(value=i)
-            self.update_idletasks()
-            time.sleep(0.05)  # Delay to simulate progress
+        # Jalankan loop animasi progress bar pada main thread
+        self._animate_progress()
 
-    def run_segmentation(self):
-        """Runs the YOLOv8 segmentation in a separate thread."""
-        output_path = os.path.join(self.patient_folder, "output-segmented.jpg")
-        run_yolov8_segmentation(self.image_path, output_path)
-        
-        # Once segmentation is complete, navigate to the results screen
+    def _run_segmentation_worker(self):
+        """Worker thread untuk menjalankan YOLOv8 tanpa memblokir GUI."""
+        try:
+            print(f"[LoadingScreen] Menjalankan YOLOv8 pada: {self.image_path}")
+            run_yolov8_segmentation(self.image_path, self.output_path)
+            self.segmentation_done = True
+        except Exception as e:
+            print(f"[LoadingScreen] Error during YOLOv8 segmentation: {e}")
+            self.segmentation_error = str(e)
+            self.segmentation_done = True
+
+    def _animate_progress(self):
+        """Animasi progress bar halus yang terkoordinasi dengan status thread."""
+        if not self.segmentation_done:
+            # Tingkatkan progress bar perlahan hingga 85% sambil menunggu model
+            if self.progress_value < 0.85:
+                self.progress_value += 0.03
+            self.progress_bar.set(self.progress_value)
+            self.pct_label.configure(text=f"{int(self.progress_value * 100)}%")
+            self.after(50, self._animate_progress)
+        else:
+            # Model selesai, isi hingga 100% lalu beralih
+            if self.progress_value < 1.0:
+                self.progress_value = min(1.0, self.progress_value + 0.1)
+                self.progress_bar.set(self.progress_value)
+                self.pct_label.configure(text=f"{int(self.progress_value * 100)}%")
+                self.after(30, self._animate_progress)
+            else:
+                # Selesai 100% -> proses hasil pada main thread
+                self._handle_completion()
+
+    def _handle_completion(self):
+        """Dipanggil di main thread setelah animasi 100% selesai."""
+        if self.segmentation_error:
+            # Jika ada error pada model AI
+            messagebox.showwarning(
+                "Peringatan Model AI",
+                f"Proses segmentasi mengalami kendala:\n{self.segmentation_error}\n\nAplikasi akan menampilkan gambar hasil tangkapan kamera."
+            )
+            # Fallback output ke captured image
+            fallback_path = self.image_path
+            self.output_path = fallback_path
+
+        # Simpan path_segmentasi ke database
+        patient_id = getattr(self.controller, 'current_patient_id', None)
+        if patient_id and DATABASE_PATH.exists():
+            try:
+                conn = sqlite3.connect(DATABASE_PATH)
+                c = conn.cursor()
+                c.execute("UPDATE pasien SET path_segmentasi = ? WHERE id = ?", (str(self.output_path), patient_id))
+                conn.commit()
+                conn.close()
+                print(f"[LoadingScreen] Database diperbarui: path_segmentasi = {self.output_path}")
+            except Exception as e:
+                print(f"[LoadingScreen] Error updating database: {e}")
+
+        # Simpan ke controller untuk ditampilkan di DiagnosisResultScreen
+        self.controller.segmentation_output_path = self.output_path
+
+        # Pindah ke layar hasil diagnosis
         self.controller.show_frame("DiagnosisResultScreen")
-        self.controller.frames["DiagnosisResultScreen"].load_segmented_image(output_path)

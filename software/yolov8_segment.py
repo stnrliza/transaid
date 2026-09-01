@@ -3,12 +3,32 @@ import cv2
 import numpy as np
 import os
 import sqlite3
+from pathlib import Path
 
-# Load YOLOv8 model
-model = YOLO('best.pt')
+# Lazy-load YOLOv8 model — tidak dimuat saat import, hanya saat dibutuhkan
+MODEL_PATH = Path(__file__).resolve().parent / "best.pt"
+DATABASE_PATH = Path(__file__).resolve().parent / "pasien.db"
+_model = None
+
+def get_model():
+    """Load YOLOv8 model on first use (lazy loading)."""
+    global _model
+    if _model is None:
+        if not MODEL_PATH.exists():
+            raise FileNotFoundError(f"Model file not found: {MODEL_PATH}")
+        if MODEL_PATH.stat().st_size < 100:
+            raise ValueError(
+                f"Model file appears to be invalid or a placeholder (size: {MODEL_PATH.stat().st_size} bytes). "
+                f"Please replace '{MODEL_PATH}' with your trained YOLOv8 model."
+            )
+        _model = YOLO(str(MODEL_PATH))
+    return _model
 
 # Fungsi untuk menjalankan segmentasi YOLOv8 dan menyimpan hasil
 def run_yolov8_segmentation(image_path, output_path):
+    # Load model (lazy — hanya dimuat sekali)
+    model = get_model()
+
     # Load the image
     print(f"Attempting to load image for segmentation: {image_path}")
     image = cv2.imread(image_path)
@@ -30,7 +50,7 @@ def run_yolov8_segmentation(image_path, output_path):
     mask_overlay = np.zeros_like(orig_img, dtype=np.uint8)
 
     if len(results) == 0:
-        print("No results from YOLOv8 segmentation, but forcing segmentation.")
+        print("No results from YOLOv8 segmentation.")
     else:
         print("Processing results...")
     
@@ -95,8 +115,8 @@ def run_yolov8_segmentation(image_path, output_path):
 
 # Fungsi untuk menyimpan path hasil segmentasi ke database
 def save_segmented_path_to_db(path_segmentasi):
-    # Koneksi ke database pasien.db
-    conn = sqlite3.connect('pasien.db')
+    """Menyimpan path hasil segmentasi ke database menggunakan path absolut."""
+    conn = sqlite3.connect(str(DATABASE_PATH))
     c = conn.cursor()
 
     # Dapatkan ID pasien terakhir yang ditambahkan dan update dengan path segmentasi

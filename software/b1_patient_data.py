@@ -1,24 +1,19 @@
-import ctypes
 import customtkinter as ctk
 import tkinter as tk
+from tkinter import messagebox
 import sqlite3
 from pathlib import Path
 from PIL import Image, ImageTk
-from datetime import datetime  
+from datetime import datetime
 
-ASSETS_PATH = Path(__file__).parent / "assets" / "frame-b1"
-PATIENTS_DATA_FOLDER = Path(__file__).parent / "Data_Pasien"
-DATABASE = Path(__file__).parent / "pasien.db"
+ASSETS_PATH = Path(__file__).resolve().parent / "assets" / "frame-b1"
+PATIENTS_DATA_FOLDER = Path(__file__).resolve().parent / "Data_Pasien"
+DATABASE = Path(__file__).resolve().parent / "pasien.db"
 
-PATIENTS_DATA_FOLDER.mkdir(parents=True, exist_ok=True)  # Membuat folder data pasien jika belum ada
+PATIENTS_DATA_FOLDER.mkdir(parents=True, exist_ok=True)
 
 def relative_to_assets(path: str) -> Path:
     return ASSETS_PATH / path
-
-try:
-    ctypes.windll.shcore.SetProcessDpiAwareness(2)
-except Exception as e:
-    print(f"Error setting DPI awareness: {e}")
 
 class PatientDataScreen(tk.Frame):
     def __init__(self, parent, controller):
@@ -26,13 +21,10 @@ class PatientDataScreen(tk.Frame):
         self.controller = controller
         self.configure(bg="#FFFFFF")
 
-        # Koneksi ke SQLite
-        self.conn = sqlite3.connect(DATABASE)
-        self.c = self.conn.cursor()
-        self.c.execute('''CREATE TABLE IF NOT EXISTS pasien
-                          (id INTEGER PRIMARY KEY, nama TEXT, tanggal_pemeriksaan TEXT)''')
+        # Inisialisasi database tabel pasien dengan skema lengkap
+        self.init_database()
 
-        # Frame untuk menempatkan elemen
+        # Frame container
         self.container = tk.Frame(self, bg="#FFFFFF")
         self.container.place(relx=0, rely=0, relwidth=1, relheight=1)
 
@@ -40,125 +32,162 @@ class PatientDataScreen(tk.Frame):
         screen_width = self.winfo_screenwidth()
         screen_height = self.winfo_screenheight()
 
-        # Menambahkan logo (lebih kecil dari yang ada di welcome screen)
+        # Logo TransAID
         logo_path = relative_to_assets("b1-image.png")
         if logo_path.exists():
             logo_image = Image.open(logo_path)
-            responsive_logo_size = logo_image.resize((int(screen_width/9.6), int(screen_height/5.4)), Image.LANCZOS)
-            logo = ImageTk.PhotoImage(responsive_logo_size)
-            self.logo_label = tk.Label(self.container, image=logo, bg="#FFFFFF")
-            self.logo_label.image = logo
+            logo_w = max(100, int(screen_width / 9.6))
+            logo_h = max(60, int(screen_height / 5.4))
+            responsive_logo = logo_image.resize((logo_w, logo_h), Image.LANCZOS)
+            self.logo_img = ImageTk.PhotoImage(responsive_logo)
+            self.logo_label = tk.Label(self.container, image=self.logo_img, bg="#FFFFFF")
             self.logo_label.place(relx=0.5, rely=0.1, anchor="n")
         else:
-            print(f"Error: File tidak ditemukan - {logo_path}")
+            self.logo_label = ctk.CTkLabel(
+                self.container,
+                text="TransAID",
+                font=("Poppins Bold", 36),
+                text_color="#16228E"
+            )
+            self.logo_label.place(relx=0.5, rely=0.1, anchor="n")
 
-        # Label untuk entry nama pasien
-        self.font_size = int(screen_height / 48)
+        self.font_size = max(14, int(screen_height / 48))
 
+        # Label & Entry: Nama Pasien
         self.name_entry_label = ctk.CTkLabel(
             self.container,
             text="Nama Pasien",
             font=("Poppins Bold", self.font_size),
             text_color="#000000",
-            fg_color="transparent")
-        self.name_entry_label.place(relx=0.1, rely=0.4, anchor="nw")
+            fg_color="transparent"
+        )
+        self.name_entry_label.place(relx=0.1, rely=0.38, anchor="nw")
 
-        # Entry nama pasien
         self.name_entry = ctk.CTkEntry(
             self.container,
-            fg_color="#DDDDDD",
+            placeholder_text="Masukkan nama lengkap pasien...",
+            fg_color="#F0F4F8",
             text_color="#000000",
             font=("Poppins Medium", self.font_size),
-            corner_radius=15)
-        self.name_entry.place(relx=0.1, rely=0.45, anchor="nw", relwidth=0.8)
+            corner_radius=15,
+            height=45
+        )
+        self.name_entry.place(relx=0.1, rely=0.44, anchor="nw", relwidth=0.8)
 
-        # Label untuk entry tanggal pemeriksaan
+        # Label & Entry: Tanggal Pemeriksaan
         self.date_entry_label = ctk.CTkLabel(
             self.container,
-            text="Tanggal Pemeriksaan",
+            text="Tanggal Pemeriksaan (YYYY-MM-DD)",
             font=("Poppins Bold", self.font_size),
             fg_color="transparent",
-            text_color="#000000")
-        self.date_entry_label.place(relx=0.1, rely=0.6, anchor="nw")
+            text_color="#000000"
+        )
+        self.date_entry_label.place(relx=0.1, rely=0.56, anchor="nw")
 
-        # Entry tanggal pemeriksaan
         self.date_entry = ctk.CTkEntry(
             self.container,
-            fg_color="#DDDDDD",
+            fg_color="#F0F4F8",
             text_color="#000000",
             font=("Poppins Medium", self.font_size),
-            corner_radius=15)
-        self.date_entry.place(relx=0.1, rely=0.65, anchor="nw", relwidth=0.8)
+            corner_radius=15,
+            height=45
+        )
+        self.date_entry.place(relx=0.1, rely=0.62, anchor="nw", relwidth=0.8)
+        self.date_entry.insert(0, datetime.now().strftime("%Y-%m-%d"))
 
-        # Tombol simpan dan navigasi ke LiveCameraScreen
+        # Tombol Kembali
         back_button = ctk.CTkButton(
             self.container,
             text="Kembali",
             font=("Poppins Medium", self.font_size),
             fg_color="#A8DEE6",
             text_color="#16228E",
+            hover_color="#8ecbd4",
             corner_radius=15,
+            width=150,
+            height=45,
             command=lambda: controller.show_frame("TransAIDScreen")
         )
-        back_button.place(relx=0.4, rely=0.8, anchor="nw")
+        back_button.place(relx=0.25, rely=0.8, anchor="center")
 
-        # Tombol simpan dan navigasi ke LiveCameraScreen
+        # Tombol Selanjutnya
         save_button = ctk.CTkButton(
             self.container,
             text="Selanjutnya",
             font=("Poppins Medium", self.font_size),
-            fg_color="#A8DEE6",
-            text_color="#16228E",
+            fg_color="#16228E",
+            text_color="#FFFFFF",
+            hover_color="#0e1761",
             corner_radius=15,
-            command=self.save_and_navigate  # Memanggil fungsi save_and_navigate sebelum pindah halaman
+            width=150,
+            height=45,
+            command=self.save_and_navigate
         )
-        save_button.place(relx=0.8, rely=0.8, anchor="nw")
+        save_button.place(relx=0.75, rely=0.8, anchor="center")
+
+    def init_database(self):
+        """Membuat tabel pasien dengan skema lengkap bila belum ada."""
+        conn = sqlite3.connect(DATABASE)
+        c = conn.cursor()
+        c.execute('''CREATE TABLE IF NOT EXISTS pasien (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            nama TEXT NOT NULL,
+            tanggal_pemeriksaan TEXT NOT NULL,
+            path_gambar TEXT,
+            path_segmentasi TEXT
+        )''')
+        conn.commit()
+        conn.close()
+
+    def on_show(self):
+        """Dipanggil saat frame ditampilkan untuk refresh form."""
+        self.name_entry.delete(0, tk.END)
+        self.date_entry.delete(0, tk.END)
+        self.date_entry.insert(0, datetime.now().strftime("%Y-%m-%d"))
+        self.name_entry.focus_set()
 
     def save_and_navigate(self):
         """
-        Menyimpan data pasien dan membuat folder pasien, lalu berpindah ke LiveCameraScreen.
+        Menyimpan data pasien ke database dan membuat folder pasien,
+        lalu berpindah ke LiveCameraScreen.
         """
-        nama, tanggal_pemeriksaan = self.get_data_pasien()
+        nama = self.name_entry.get().strip()
+        tanggal_pemeriksaan = self.date_entry.get().strip()
 
-        if not nama.strip():  # Memeriksa apakah nama pasien kosong
-            print("Nama pasien tidak boleh kosong!")
+        if not nama:
+            messagebox.showwarning("Data Tidak Lengkap", "Nama pasien tidak boleh kosong!")
             return
 
-        # Format tanggal pemeriksaan ke YYYY-MM-DD
+        # Validasi format tanggal YYYY-MM-DD
         try:
             tanggal_pemeriksaan = datetime.strptime(tanggal_pemeriksaan, "%Y-%m-%d").strftime("%Y-%m-%d")
         except ValueError:
-            print("Format tanggal tidak valid! Harus dalam format YYYY-MM-DD.")
+            messagebox.showerror("Format Tanggal Salah", "Format tanggal tidak valid!\nSilakan gunakan format YYYY-MM-DD (contoh: 2026-09-01).")
             return
 
-        # Menyimpan data ke database
-        self.save_pasien(nama, tanggal_pemeriksaan)
+        # Menyimpan data pasien ke database
+        patient_id = self.insert_pasien(nama, tanggal_pemeriksaan)
 
-        # Ambil nomor pasien terakhir
-        patient_number = self.get_last_patient_number() + 1
-
-        # Membuat folder untuk setiap pasien
-        folder_name = PATIENTS_DATA_FOLDER / f"{tanggal_pemeriksaan}_Pasien-{patient_number}"
+        # Membuat folder unik untuk pasien ini
+        folder_name = PATIENTS_DATA_FOLDER / f"{tanggal_pemeriksaan}_Pasien-{patient_id}"
         folder_name.mkdir(parents=True, exist_ok=True)
-        print(f"Folder created: {folder_name}")
+        print(f"Folder pasien dibuat: {folder_name}")
 
-        # Pindah ke LiveCameraScreen setelah menyimpan data
+        # Simpan state ke controller agar dapat diakses oleh LiveCameraScreen & DiagnosisResultScreen
+        self.controller.current_patient_id = patient_id
+        self.controller.current_patient_nama = nama
+        self.controller.current_patient_tanggal = tanggal_pemeriksaan
+        self.controller.current_patient_folder = folder_name
+
+        # Pindah ke LiveCameraScreen
         self.controller.show_frame("LiveCameraScreen")
 
-    def get_last_patient_number(self):
-        """ Mengambil jumlah pasien dari database. """
-        self.c.execute("SELECT COUNT(*) FROM pasien")
-        return self.c.fetchone()[0]
-
-    def save_pasien(self, nama, tanggal_pemeriksaan):
-        """ Menyimpan data pasien ke database. """
-        self.c.execute("INSERT INTO pasien (nama, tanggal_pemeriksaan) VALUES (?, ?)", (nama, tanggal_pemeriksaan))
-        self.conn.commit()
-
-    def get_data_pasien(self):
-        """ Mengambil data pasien dari entry. """
-        return self.name_entry.get(), self.date_entry.get()
-
-    def __del__(self):
-        """ Menutup koneksi ke database ketika objek dihapus. """
-        self.conn.close()
+    def insert_pasien(self, nama, tanggal_pemeriksaan):
+        """Menyimpan data pasien baru ke database dan mengembalikan ID-nya."""
+        conn = sqlite3.connect(DATABASE)
+        c = conn.cursor()
+        c.execute("INSERT INTO pasien (nama, tanggal_pemeriksaan) VALUES (?, ?)", (nama, tanggal_pemeriksaan))
+        conn.commit()
+        patient_id = c.lastrowid
+        conn.close()
+        return patient_id
