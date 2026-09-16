@@ -19,14 +19,14 @@
   - **False Positive Rate:** 12.5%
 
 ## **System Architecture**
-![System Architecture](https://github.com/stnrliza/transaid/blob/master/readme-images/architecture.png)
+![System Architecture](https://github.com/stnrliza/transaid/blob/master/pimnas/readme-images/architecture.png)
 
 ## **3D Design** 
-![3D Design](https://github.com/stnrliza/transaid/blob/master/readme-images/3d.gif)
+![3D Design](https://github.com/stnrliza/transaid/blob/master/pimnas/readme-images/3d.gif)
 
 
 ## **Software Flow and Description**
-![Software Flow](https://github.com/stnrliza/transaid/blob/master/readme-images/software-flow.png)
+![Software Flow](https://github.com/stnrliza/transaid/blob/master/pimnas/readme-images/software-flow.png)
 
 ### **Software Files**
 | File Name | Description |
