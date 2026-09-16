@@ -1,0 +1,297 @@
+# -*- coding: utf-8 -*-
+"""
+benchmark_jetson.py
+Benchmark YOLOv8 inference speed: ONNX vs TensorRT (FP16)
+Platform: Jetson Nano (JetPack 4.6.1, TensorRT 8.x)
+
+Usage:
+  python benchmark_jetson.py --mode onnx
+  python benchmark_jetson.py --mode tensorrt
+  python benchmark_jetson.py --mode both   (default)
+"""
+
+import time
+import random
+import argparse
+import csv
+import subprocess
+import platform
+import os
+import numpy as np
+from PIL import Image
+from pathlib import Path
+from datetime import datetime
+
+# CONFIG
+MODEL_ONNX   = "/home/jetson/Desktop/yolov8l_best.onnx"
+MODEL_TRT    = "/home/jetson/Desktop/yolov8l_best.engine"
+TEST_IMAGE   = "/home/jetson/Desktop/images/"
+IMG_SIZE     = 640
+WARMUP_RUNS  = 10
+BENCH_RUNS   = 100
+CONF_THRESH  = 0.10
+IOU_THRESH   = 0.30
+
+
+def get_image_list(image_dir):
+    exts = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+    img_dir = Path(image_dir)
+    if not img_dir.is_dir():
+        raise NotADirectoryError("TEST_IMAGE bukan direktori: {}".format(image_dir))
+    paths = [p for p in img_dir.iterdir() if p.suffix.lower() in exts]
+    if not paths:
+        raise FileNotFoundError("Tidak ada gambar di: {}".format(image_dir))
+    return paths
+
+
+def get_jetson_info():
+    info = {
+        "platform": platform.platform(),
+        "machine":  platform.machine(),
+    }
+    try:
+        with open("/proc/device-tree/model", "r") as f:
+            info["jetson_model"] = f.read().strip().replace("\x00", "")
+    except Exception:
+        info["jetson_model"] = "Unknown Jetson"
+    try:
+        with open("/proc/meminfo", "r") as f:
+            for line in f:
+                if "MemTotal" in line:
+                    kb = int(line.split()[1])
+                    info["ram_gb"] = round(kb / 1e6, 2)
+                    break
+    except Exception:
+        info["ram_gb"] = "N/A"
+    try:
+        result = subprocess.run(
+            ["tegrastats", "--interval", "100"],
+            capture_output=True, text=True, timeout=2
+        )
+        info["tegrastats_sample"] = result.stdout.split("\n")[0]
+    except Exception:
+        info["tegrastats_sample"] = "tegrastats tidak tersedia"
+    return info
+
+
+def prepare_blob_onnx(path):
+    img = Image.open(str(path)).resize((IMG_SIZE, IMG_SIZE)).convert("RGB")
+    blob = np.array(img).astype(np.float32) / 255.0
+    return np.transpose(blob, (2, 0, 1))[np.newaxis, ...]
+
+
+def prepare_blob_trt(path):
+    img = Image.open(str(path)).resize((IMG_SIZE, IMG_SIZE)).convert("RGB")
+    blob = np.array(img).astype(np.float32) / 255.0
+    blob = np.transpose(blob, (2, 0, 1))[np.newaxis, ...]
+    return np.ascontiguousarray(blob, dtype=np.float16)
+
+
+def compute_stats(latencies, format_name, device):
+    arr = np.array(latencies)
+    return {
+        "format":    format_name,
+        "device":    device,
+        "runs":      len(latencies),
+        "mean_ms":   round(float(np.mean(arr)), 2),
+        "median_ms": round(float(np.median(arr)), 2),
+        "std_ms":    round(float(np.std(arr)), 2),
+        "min_ms":    round(float(np.min(arr)), 2),
+        "max_ms":    round(float(np.max(arr)), 2),
+        "fps":       round(1000 / float(np.mean(arr)), 2),
+        "p95_ms":    round(float(np.percentile(arr, 95)), 2),
+    }
+
+
+def benchmark_onnx(image_list, warmup=WARMUP_RUNS, runs=BENCH_RUNS):
+    try:
+        import onnxruntime as ort
+    except ImportError:
+        print("[SKIP] onnxruntime tidak tersedia.")
+        return None
+
+    print("\n" + "=" * 55)
+    print("[ONNX] Loading {} ...".format(MODEL_ONNX))
+
+    providers = ort.get_available_providers()
+    print("[ONNX] Available providers: {}".format(providers))
+
+    if "CUDAExecutionProvider" in providers:
+        ep = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        device_label = "CUDA"
+    else:
+        ep = ["CPUExecutionProvider"]
+        device_label = "CPU"
+    print("[ONNX] Using: {}".format(ep[0]))
+
+    sess = ort.InferenceSession(MODEL_ONNX, providers=ep)
+    input_name = sess.get_inputs()[0].name
+    print("[ONNX] Input name: {}".format(input_name))
+    print("[ONNX] Pool gambar: {} file".format(len(image_list)))
+
+    print("[ONNX] Warmup {}x ...".format(warmup))
+    for _ in range(warmup):
+        blob = prepare_blob_onnx(random.choice(image_list))
+        sess.run(None, {input_name: blob})
+
+    print("[ONNX] Benchmarking {}x ...".format(runs))
+    latencies = []
+    for i in range(runs):
+        blob = prepare_blob_onnx(random.choice(image_list))
+        t0 = time.perf_counter()
+        sess.run(None, {input_name: blob})
+        t1 = time.perf_counter()
+        latencies.append((t1 - t0) * 1000)
+        if (i + 1) % 20 == 0:
+            print("  [{}/{}] {:.1f} ms".format(i + 1, runs, latencies[-1]))
+
+    return compute_stats(latencies, "ONNX", device_label)
+
+
+def benchmark_tensorrt(image_list, warmup=WARMUP_RUNS, runs=BENCH_RUNS):
+    try:
+        import tensorrt as trt
+        import pycuda.driver as cuda
+        import pycuda.autoinit
+    except ImportError as e:
+        print("[SKIP] TensorRT/pycuda tidak tersedia: {}".format(e))
+        return None
+
+    print("\n" + "=" * 55)
+    print("[TensorRT] Loading {} ...".format(MODEL_TRT))
+
+    TRT_LOGGER = trt.Logger(trt.Logger.WARNING)
+    runtime = trt.Runtime(TRT_LOGGER)
+
+    with open(MODEL_TRT, "rb") as f:
+        engine = runtime.deserialize_cuda_engine(f.read())
+
+    context = engine.create_execution_context()
+    print("[TensorRT] Engine loaded.")
+    print("[TensorRT] Pool gambar: {} file".format(len(image_list)))
+
+    input_idx  = engine.get_binding_index(engine.get_binding_name(0))
+    output_idx = engine.get_binding_index(engine.get_binding_name(1))
+
+    input_shape  = tuple(engine.get_binding_shape(input_idx))
+    output_shape = tuple(engine.get_binding_shape(output_idx))
+
+    input_nbytes  = int(np.prod(input_shape)) * np.dtype(np.float16).itemsize
+    output_nbytes = int(np.prod(output_shape)) * np.dtype(np.float16).itemsize
+
+    d_input  = cuda.mem_alloc(input_nbytes)
+    d_output = cuda.mem_alloc(output_nbytes)
+    bindings = [int(d_input), int(d_output)]
+
+    h_output = cuda.pagelocked_empty(int(np.prod(output_shape)), dtype=np.float16)
+    stream   = cuda.Stream()
+
+    def _infer(blob):
+        cuda.memcpy_htod_async(d_input, blob, stream)
+        context.execute_async_v2(bindings=bindings, stream_handle=stream.handle)
+        cuda.memcpy_dtoh_async(h_output, d_output, stream)
+        stream.synchronize()
+
+    print("[TensorRT] Warmup {}x ...".format(warmup))
+    for _ in range(warmup):
+        blob = prepare_blob_trt(random.choice(image_list))
+        _infer(blob)
+
+    print("[TensorRT] Benchmarking {}x ...".format(runs))
+    latencies = []
+    for i in range(runs):
+        blob = prepare_blob_trt(random.choice(image_list))
+        t0 = time.perf_counter()
+        _infer(blob)
+        t1 = time.perf_counter()
+        latencies.append((t1 - t0) * 1000)
+        if (i + 1) % 20 == 0:
+            print("  [{}/{}] {:.1f} ms".format(i + 1, runs, latencies[-1]))
+
+    return compute_stats(latencies, "TensorRT-FP16", "GPU")
+
+
+def print_results(results):
+    print("\n" + "=" * 65)
+    print("BENCHMARK RESULTS - JETSON NANO")
+    print("=" * 65)
+    header = "{:<16} {:<8} {:<10} {:<10} {:<8} {:<8} {:<10}".format(
+        "Format", "Device", "Mean(ms)", "Median", "Std", "FPS", "P95(ms)")
+    print(header)
+    print("-" * len(header))
+    for r in results:
+        if r is None:
+            continue
+        print("{:<16} {:<8} {:<10} {:<10} {:<8} {:<8} {:<10}".format(
+            r["format"], r["device"], r["mean_ms"],
+            r["median_ms"], r["std_ms"], r["fps"], r["p95_ms"]))
+
+
+def save_csv(results, sysinfo):
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    fname = "/home/jetson/Desktop/benchmark_jetson_{}.csv".format(timestamp)
+    fieldnames = ["format", "device", "runs", "mean_ms", "median_ms",
+                  "std_ms", "min_ms", "max_ms", "fps", "p95_ms",
+                  "jetson_model", "ram_gb"]
+    with open(fname, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for r in results:
+            if r is None:
+                continue
+            row = {**r,
+                   "jetson_model": sysinfo.get("jetson_model", ""),
+                   "ram_gb":       sysinfo.get("ram_gb", "")}
+            for fn in fieldnames:
+                if fn not in row:
+                    row[fn] = ""
+            writer.writerow({k: row[k] for k in fieldnames})
+    print("\n[CSV] Hasil disimpan ke: {}".format(fname))
+    return fname
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="YOLO Benchmark - Jetson Nano")
+    parser.add_argument(
+        "--mode",
+        choices=["onnx", "tensorrt", "both"],
+        default="both",
+        help="Format yang di-benchmark (default: both)"
+    )
+    args = parser.parse_args()
+
+    print("=" * 65)
+    print("YOLO INFERENCE BENCHMARK - JETSON NANO")
+    print("Timestamp : {}".format(datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+    print("Mode      : {}".format(args.mode))
+    print("=" * 65)
+
+    sysinfo = get_jetson_info()
+    print("\n[System Info]")
+    for k, v in sysinfo.items():
+        print("  {}: {}".format(k, v))
+
+    try:
+        image_list = get_image_list(TEST_IMAGE)
+        print("\n[Images] Ditemukan {} gambar di: {}".format(len(image_list), TEST_IMAGE))
+    except (NotADirectoryError, FileNotFoundError) as e:
+        print("\n[ERROR] {}".format(e))
+        exit(1)
+
+    results = []
+
+    if args.mode in ("onnx", "both"):
+        r = benchmark_onnx(image_list)
+        results.append(r)
+
+    if args.mode in ("tensorrt", "both"):
+        r = benchmark_tensorrt(image_list)
+        results.append(r)
+
+    if results:
+        print_results(results)
+        save_csv(results, sysinfo)
+    else:
+        print("\n[ERROR] Tidak ada hasil benchmark.")
+
+    print("\n[DONE] Transfer CSV ke laptop untuk analisis.")
