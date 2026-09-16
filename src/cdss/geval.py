@@ -1,64 +1,46 @@
 """
-05_geval.py — G-Eval (reference-free LLM-as-judge) for NILT CDSS reports.
+G-Eval (Reference-Free LLM-as-a-Judge) Evaluation for NILT CDSS Reports.
 
-Evaluates the two report variants produced by 03_pipeline.py:
-  - laporan_dokter (dentist-facing): coherence, completeness, relevance, fluency
-  - laporan_pasien (patient-facing): simplicity, clarity, fluency, conciseness
+Evaluates dual-audience clinical reports produced by the CDSS reporting pipeline:
+  - Dentist-facing report (laporan_dokter): Coherence, completeness, relevance, fluency
+  - Patient-facing report (laporan_pasien): Simplicity, clarity, fluency, conciseness
 
-Method: G-Eval form-filling paradigm (Liu et al., 2023) — each criterion has a
-fixed chain-of-thought rubric baked into the prompt; the judge LLM returns a
-1-5 score + short reasoning per criterion as JSON.
-
-NOTE on fidelity to the original G-Eval paper: the paper weights the final
-score by the token-level probability distribution over scores 1-5 (using
-logprobs from the judge model) to get a continuous score, which smooths out
-single-sample judge noise. This script does NOT do that — we take the judge's
-single direct score per criterion instead. This is a documented simplification;
-if you want to approximate the paper's behavior, increase N_SAMPLES below to
-self-consistency-average multiple independent judge calls per criterion instead
-of relying on logprobs.
-
-Judge LLM: Qwen3:14b via local Ollama instance.
-
-Run:
-    python 05_geval.py
+Methodology:
+Follows the G-Eval form-filling paradigm (Liu et al., 2023). Each evaluation
+criterion defines a rubric with explicit chain-of-thought steps. A judge LLM
+(e.g., Qwen3:14b via local Ollama) scores each criterion from 1 to 5 and produces
+justification reasoning.
 """
 
 import csv
+import glob
 import json
 import os
 import random
 import re
 import sys
 import time
-import glob
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 import requests
 
+# ── CONFIGURATION & ENVIRONMENT ─────────────────────
+BASE_DIR            = Path(__file__).resolve().parent
+OLLAMA_BASE_URL     = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+JUDGE_MODEL         = os.getenv("JUDGE_MODEL", "qwen3:14b")
+INPUT_DIR           = Path(os.getenv("GEVAL_INPUT_DIR", str(BASE_DIR / "outputs" / "reports")))
+OUTPUT_DIR          = Path(os.getenv("GEVAL_OUTPUT_DIR", str(BASE_DIR / "outputs" / "geval")))
+REPORT_PATTERN      = os.getenv("REPORT_PATTERN", "laporan_*.json")
+SLEEP_BETWEEN_CALLS = float(os.getenv("SLEEP_BETWEEN_CALLS", "1.0"))
+SKIP_EXISTING       = os.getenv("SKIP_EXISTING", "True").lower() in ("true", "1", "yes")
+# ────────────────────────────────────────────────────
 
-# --------------------------------------------------------------------------- #
-# Config — edit here, no CLI needed
-# --------------------------------------------------------------------------- #
-
-OLLAMA_BASE_URL     = "http://localhost:11434"   # Ollama server address
-JUDGE_MODEL         = "qwen3:14b"
-INPUT_DIR           = "/home/guest/Workshop/skripsi-lija/cdss/outputs/03_reports/fix"
-OUTPUT_DIR          = "/home/guest/Workshop/skripsi-lija/cdss/outputs/05_geval/fix"
-REPORT_PATTERN      = "laporan_*.json"
-SLEEP_BETWEEN_CALLS = 1.0   # seconds between each judge call.
-                            # Running locally via Ollama — no rate limits,
-                            # but a small pause avoids overwhelming the GPU.
-SKIP_EXISTING       = True  # set False to re-score reports that already have a sidecar
-
-
-# --------------------------------------------------------------------------- #
-# Criteria definitions (G-Eval form-filling style: name + CoT evaluation steps)
-# --------------------------------------------------------------------------- #
 
 @dataclass
 class Criterion:
+    """Evaluation criterion definition with chain-of-thought rubric steps."""
     name: str
     description: str
     evaluation_steps: list[str]
@@ -211,10 +193,6 @@ PASIEN_CRITERIA: list[Criterion] = [
 ]
 
 
-# --------------------------------------------------------------------------- #
-# Judge LLM call (Ollama /api/generate endpoint)
-# --------------------------------------------------------------------------- #
-
 PROMPT_TEMPLATE = """You are an expert dental clinician evaluating an AI-generated clinical report for quality. You will evaluate ONE criterion at a time using the chain-of-thought steps provided.
 
 # Criterion: {criterion_name}
@@ -238,7 +216,22 @@ Follow the evaluation steps above internally, then output ONLY a JSON object wit
 
 
 def build_prompt(criterion: Criterion, doc_type_label: str, report_text: str,
-                  query: str, tooth: str, lokasi: str, severity: str) -> str:
+                 query: str, tooth: str, lokasi: str, severity: str) -> str:
+    """
+    Format the chain-of-thought evaluation prompt for a specific criterion.
+
+    Args:
+        criterion: Target evaluation criterion with rubric steps.
+        doc_type_label: Label indicating audience ('Dentist-facing' or 'Patient-facing').
+        report_text: Text content of the clinical report sections under test.
+        query: Detection query string.
+        tooth: FDI tooth number.
+        lokasi: Tooth surface.
+        severity: Clinical severity string.
+
+    Returns:
+        Formatted prompt string ready for LLM invocation.
+    """
     steps = "\n".join(f"{i+1}. {s}" for i, s in enumerate(criterion.evaluation_steps))
     return PROMPT_TEMPLATE.format(
         criterion_name=criterion.name,
@@ -255,21 +248,21 @@ def build_prompt(criterion: Criterion, doc_type_label: str, report_text: str,
 
 def call_ollama(prompt: str, model: str, base_url: str,
                 max_retries: int = 5, timeout: int = 300) -> dict:
-    """Call Ollama via its /api/generate endpoint. Returns parsed dict.
+    """
+    Query Ollama /api/generate endpoint with retry backoff and robust JSON extraction.
 
-    NOTE: We do NOT use Ollama's format='json' parameter because it is
-    incompatible with Qwen3 on Ollama 0.24.0 (produces empty '{}').
-    Instead, we rely on prompt instructions and parse JSON from the raw
-    text response after stripping <think> tags and markdown fences.
+    Args:
+        prompt: Full evaluation prompt text.
+        model: Ollama judge model identifier.
+        base_url: Ollama HTTP base URL.
+        max_retries: Maximum network retry attempts.
+        timeout: Request timeout in seconds.
 
-    num_predict is set to 2048 because Qwen3 is a thinking model that
-    wraps internal reasoning in <think>...</think> tags.  With complex
-    evaluation prompts, the thinking alone can exceed 512 tokens, leaving
-    nothing for the actual JSON output.  2048 gives ample room.
+    Returns:
+        Parsed response dictionary containing 'score' and 'reasoning'.
     """
     url = f"{base_url}/api/generate"
 
-    # Prepend system instruction to the prompt.
     full_prompt = (
         "You are an expert evaluator. Always respond with valid JSON only. "
         "The JSON must have exactly two keys: \"score\" (integer 1-5) and "
@@ -305,18 +298,14 @@ def call_ollama(prompt: str, model: str, base_url: str,
             resp.raise_for_status()
             data = resp.json()
             raw_text = data["response"]
-            # Strip any <think>...</think> tags that Qwen3 may emit
+            # Strip reasoning tags emitted by thinking models
             text = re.sub(r"<think>.*?</think>", "", raw_text, flags=re.DOTALL).strip()
-            # Strip markdown code fences if present
             text = re.sub(r"^\s*$", "", text).strip()
-            # Extract the JSON object from the text
             match = re.search(r"\{.*\}", text, flags=re.DOTALL)
             if match:
                 return json.loads(match.group())
-            # Debug: log what we got so we can diagnose
             print(f"  [debug] raw response length={len(raw_text)}, "
-                  f"after strip length={len(text)}, "
-                  f"text={text[:200]!r}",
+                  f"after strip length={len(text)}, text={text[:200]!r}",
                   file=sys.stderr)
             raise json.JSONDecodeError("No JSON object found in response", text, 0)
         except requests.exceptions.Timeout as e:
@@ -336,32 +325,33 @@ def call_ollama(prompt: str, model: str, base_url: str,
 
 
 def extract_score(parsed: dict, criterion_name: str) -> tuple[Optional[int], str]:
-    """Extract score and reasoning from parsed JSON, with fuzzy key matching.
-
-    Qwen3 sometimes uses variant key names (e.g. 'skor' instead of 'score',
-    'alasan' instead of 'reasoning'). This function tries common alternatives.
     """
-    # Try common key variants for score
+    Extract numeric score and qualitative reasoning with fuzzy key matching.
+
+    Args:
+        parsed: Raw parsed dictionary from judge LLM response.
+        criterion_name: Name of evaluated criterion for logging context.
+
+    Returns:
+        Tuple of (score_int, reasoning_str).
+    """
     score = None
     for key in ("score", "skor", "nilai", "Score", "SCORE"):
         if key in parsed:
             score = parsed[key]
             break
-    # If still None, try to find any integer value in the dict
     if score is None:
         for v in parsed.values():
             if isinstance(v, int) and 1 <= v <= 5:
                 score = v
                 break
 
-    # Try common key variants for reasoning
     reasoning = ""
     for key in ("reasoning", "reason", "alasan", "justifikasi",
                 "penjelasan", "Reasoning", "REASONING"):
         if key in parsed:
             reasoning = str(parsed[key])
             break
-    # If still empty, try to find the longest string value as reasoning
     if not reasoning:
         for v in parsed.values():
             if isinstance(v, str) and len(v) > len(reasoning):
@@ -387,11 +377,16 @@ def extract_score(parsed: dict, criterion_name: str) -> tuple[Optional[int], str
     return score, reasoning
 
 
-# --------------------------------------------------------------------------- #
-# Report loading / text assembly
-# --------------------------------------------------------------------------- #
-
 def assemble_dokter_text(report: dict) -> str:
+    """
+    Extract and concatenate dentist-facing report sections for evaluation.
+
+    Args:
+        report: Report dictionary loaded from JSON sidecar.
+
+    Returns:
+        Formatted text containing Temuan, Interpretasi, and Rekomendasi.
+    """
     d = report["report"]["laporan_dokter"]
     return (
         f"Temuan: {d.get('temuan', '')}\n"
@@ -401,6 +396,15 @@ def assemble_dokter_text(report: dict) -> str:
 
 
 def assemble_pasien_text(report: dict) -> str:
+    """
+    Extract and concatenate patient-facing report sections for evaluation.
+
+    Args:
+        report: Report dictionary loaded from JSON sidecar.
+
+    Returns:
+        Formatted text containing Ringkasan and Saran.
+    """
     p = report["report"]["laporan_pasien"]
     return (
         f"Ringkasan: {p.get('ringkasan', '')}\n"
@@ -409,16 +413,34 @@ def assemble_pasien_text(report: dict) -> str:
 
 
 def load_report(path: str) -> dict:
+    """
+    Read and parse a JSON clinical report sidecar from disk.
+
+    Args:
+        path: Filesystem path to target JSON file.
+
+    Returns:
+        Deserialized report dictionary.
+    """
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
 
-# --------------------------------------------------------------------------- #
-# Main evaluation loop
-# --------------------------------------------------------------------------- #
-
 def evaluate_report(report: dict, report_id: str, model: str, base_url: str,
-                     sleep_between_calls: float) -> dict:
+                    sleep_between_calls: float) -> dict:
+    """
+    Run full G-Eval evaluation suite across all dentist and patient criteria for one report.
+
+    Args:
+        report: Parsed clinical report dictionary.
+        report_id: Report identifier string.
+        model: Ollama judge model name.
+        base_url: Ollama server endpoint.
+        sleep_between_calls: Delay in seconds between successive evaluation calls.
+
+    Returns:
+        Dictionary containing structured scores and reasoning for all criteria.
+    """
     query = report.get("query", "")
     manual = report.get("manual_input", {})
     tooth = manual.get("no_gigi", "")
@@ -430,7 +452,7 @@ def evaluate_report(report: dict, report_id: str, model: str, base_url: str,
     dokter_text = assemble_dokter_text(report)
     for crit in DOKTER_CRITERIA:
         prompt = build_prompt(crit, "Dentist-facing report (laporan_dokter)",
-                               dokter_text, query, tooth, lokasi, severity)
+                              dokter_text, query, tooth, lokasi, severity)
         parsed = call_ollama(prompt, model, base_url)
         score, reasoning = extract_score(parsed, crit.name)
         result["dokter"][crit.name] = {"score": score, "reasoning": reasoning}
@@ -440,7 +462,7 @@ def evaluate_report(report: dict, report_id: str, model: str, base_url: str,
     pasien_text = assemble_pasien_text(report)
     for crit in PASIEN_CRITERIA:
         prompt = build_prompt(crit, "Patient-facing report (laporan_pasien)",
-                               pasien_text, query, tooth, lokasi, severity)
+                              pasien_text, query, tooth, lokasi, severity)
         parsed = call_ollama(prompt, model, base_url)
         score, reasoning = extract_score(parsed, crit.name)
         result["pasien"][crit.name] = {"score": score, "reasoning": reasoning}
@@ -450,14 +472,33 @@ def evaluate_report(report: dict, report_id: str, model: str, base_url: str,
     return result
 
 
-def write_sidecar(result: dict, output_dir: str, report_id: str) -> str:
-    out_path = os.path.join(output_dir, f"{report_id}_geval.json")
+def write_sidecar(result: dict, output_dir: Path, report_id: str) -> str:
+    """
+    Save evaluation result dictionary to a JSON sidecar file.
+
+    Args:
+        result: Evaluation scores and reasoning dictionary.
+        output_dir: Destination output directory.
+        report_id: Base identifier for report file.
+
+    Returns:
+        Path string to written sidecar JSON.
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    out_path = str(output_dir / f"{report_id}_geval.json")
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(result, f, ensure_ascii=False, indent=2)
     return out_path
 
 
 def append_to_csv_rows(result: dict, rows: list[dict]) -> None:
+    """
+    Flatten hierarchical evaluation results and append row records for CSV export.
+
+    Args:
+        result: Structured evaluation result dictionary.
+        rows: Destination list of row dictionaries.
+    """
     for doc_type in ("dokter", "pasien"):
         for criterion, payload in result[doc_type].items():
             rows.append({
@@ -469,8 +510,19 @@ def append_to_csv_rows(result: dict, rows: list[dict]) -> None:
             })
 
 
-def write_aggregate_csv(rows: list[dict], output_dir: str) -> str:
-    out_path = os.path.join(output_dir, "geval_scores.csv")
+def write_aggregate_csv(rows: list[dict], output_dir: Path) -> str:
+    """
+    Write all collected evaluation records into an aggregate CSV spreadsheet.
+
+    Args:
+        rows: List of row dictionaries.
+        output_dir: Destination output directory.
+
+    Returns:
+        Path string to written CSV file.
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    out_path = str(output_dir / "geval_scores.csv")
     fieldnames = ["report_id", "doc_type", "criterion", "score", "reasoning"]
     with open(out_path, "w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -480,7 +532,10 @@ def write_aggregate_csv(rows: list[dict], output_dir: str) -> str:
 
 
 def main():
-    # Quick connectivity check — make sure Ollama is reachable
+    """
+    Orchestrate batch G-Eval evaluation across all target clinical report sidecars.
+    """
+    # Connectivity check with Ollama
     try:
         r = requests.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=5)
         r.raise_for_status()
@@ -490,16 +545,16 @@ def main():
                   f"Available: {models}. Will attempt to pull on first call.",
                   file=sys.stderr)
         else:
-            print(f"Using Ollama model: {JUDGE_MODEL}")
+            print(f"Using Ollama judge model: {JUDGE_MODEL}")
     except requests.RequestException as e:
         print(f"ERROR: cannot reach Ollama at {OLLAMA_BASE_URL}: {e}",
               file=sys.stderr)
-        print("Make sure 'ollama serve' is running.", file=sys.stderr)
+        print("Ensure 'ollama serve' is running.", file=sys.stderr)
         sys.exit(1)
 
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    paths = sorted(glob.glob(os.path.join(INPUT_DIR, REPORT_PATTERN)))
+    paths = sorted(glob.glob(str(INPUT_DIR / REPORT_PATTERN)))
     if not paths:
         print(f"No files matched '{REPORT_PATTERN}' in {INPUT_DIR}", file=sys.stderr)
         sys.exit(1)
@@ -509,9 +564,9 @@ def main():
 
     for path in paths:
         report_id = os.path.splitext(os.path.basename(path))[0]
-        sidecar_path = os.path.join(OUTPUT_DIR, f"{report_id}_geval.json")
+        sidecar_path = OUTPUT_DIR / f"{report_id}_geval.json"
 
-        if SKIP_EXISTING and os.path.exists(sidecar_path):
+        if SKIP_EXISTING and sidecar_path.exists():
             print(f"[skip] {report_id} (sidecar exists)")
             with open(sidecar_path, "r", encoding="utf-8") as f:
                 result = json.load(f)

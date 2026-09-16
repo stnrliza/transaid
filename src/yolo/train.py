@@ -1,71 +1,76 @@
 """
-train_exp1_olddataset.py
-------------------------
-EKSPERIMEN 1: Isolasi variabel dataset.
+YOLO Instance Segmentation Training Module for Dental Caries Detection.
 
-Tujuan:
-  Menguji apakah YOLO11l-seg bisa mencapai precision ~0.90 jika menggunakan
-  dataset lama (CariesDatasetCleanSG) yang sama dengan run berhasil (train_best_l2).
-
-  Hyperparameter disamakan PERSIS dengan train_best_l2 (yolov8l-seg, precision 0.90).
-
-Hipotesis:
-  - Jika berhasil (precision >= 0.80) → masalah ada di dataset baru, bukan arsitektur YOLO11
-  - Jika gagal (precision tetap rendah) → masalah ada di arsitektur YOLO11 → coba yolov8l-seg
+This module trains and validates an Ultralytics YOLO instance segmentation model
+(e.g., YOLOv8s-seg / YOLO11s-seg) on Near-Infrared Light Transillumination (NILT)
+caries datasets using AdamW optimization, cosine learning rate decay, and tailored
+geometric/photometric data augmentations.
 """
 
-import torch
+import os
 from pathlib import Path
+import torch
 from ultralytics import YOLO
 
-
-# ─────────────────────────────────────────────
-# PATHS
-# ─────────────────────────────────────────────
-BASE_DIR   = Path(__file__).parent
-# Dataset lama yang terbukti berhasil
-DATA_YAML  = Path("/home/guest/Workshop/skripsi-lija/skripsi/BAB_4/1.yolov8seg/dataset/CariesDatasetCleanSG/data.yaml")
-OUTPUT_DIR = BASE_DIR / "runs"
-
-
-# ─────────────────────────────────────────────
-# CONFIG — sama persis dengan train_best_l2
-# ─────────────────────────────────────────────
-PRETRAINED_MODEL = "yolov8l-seg.pt"
-EPOCHS           = 500
-IMGSZ            = 640
-BATCH_SIZE       = -1       # auto batch, sama dengan train_best_l2
-SAVE_PERIOD      = 50
+# ── PATHS & CONFIGURATION ───────────────────────────
+BASE_DIR         = Path(__file__).resolve().parent
+DATA_YAML        = Path(os.getenv("DATA_YAML", str(BASE_DIR / "data.yaml")))
+OUTPUT_DIR       = Path(os.getenv("YOLO_OUTPUT_DIR", str(BASE_DIR / "runs")))
+PRETRAINED_MODEL = os.getenv("PRETRAINED_MODEL", "yolov8s-seg.pt")
+EPOCHS           = int(os.getenv("EPOCHS", "500"))
+IMGSZ            = int(os.getenv("IMGSZ", "640"))
+BATCH_SIZE       = int(os.getenv("BATCH_SIZE", "-1"))   # -1 enables automated batch sizing
+SAVE_PERIOD      = int(os.getenv("SAVE_PERIOD", "50"))
 DEVICE           = 0 if torch.cuda.is_available() else "cpu"
+# ────────────────────────────────────────────────────
 
 
-# ─────────────────────────────────────────────
-# MAIN
-# ─────────────────────────────────────────────
-def main():
-    if not DATA_YAML.exists():
-        print(f"[ERROR] Data YAML tidak ditemukan: {DATA_YAML}")
-        return
+def train_model(data_yaml: Path = DATA_YAML,
+                pretrained_model: str = PRETRAINED_MODEL,
+                epochs: int = EPOCHS,
+                imgsz: int = IMGSZ,
+                batch_size: int = BATCH_SIZE,
+                output_dir: Path = OUTPUT_DIR,
+                device: str | int = DEVICE):
+    """
+    Train and validate a YOLO instance segmentation model on the specified dataset.
+
+    Args:
+        data_yaml: Path to the dataset configuration YAML file.
+        pretrained_model: Initial model weights checkpoint name or file path.
+        epochs: Number of training epochs.
+        imgsz: Target image square resolution.
+        batch_size: Training batch size (-1 for auto-batch).
+        output_dir: Destination project output directory.
+        device: Target compute device (GPU index or 'cpu').
+
+    Returns:
+        Ultralytics validation metrics object.
+    """
+    if not data_yaml.exists():
+        print(f"[ERROR] Dataset YAML configuration not found at: {data_yaml}")
+        print("Please configure DATA_YAML in your environment or provide a valid data.yaml path.")
+        return None
 
     print("=" * 60)
-    print("EKSPERIMEN 1: YOLO11l + Dataset Lama (CariesDatasetCleanSG)")
+    print("YOLO Instance Segmentation Training")
     print("=" * 60)
-    print(f"Model   : {PRETRAINED_MODEL}")
-    print(f"Device  : {'GPU' if DEVICE == 0 else 'CPU'}")
-    print(f"Data    : {DATA_YAML}")
-    print(f"Epochs  : {EPOCHS}")
+    print(f"Model   : {pretrained_model}")
+    print(f"Device  : {'GPU ' + str(device) if device != 'cpu' else 'CPU'}")
+    print(f"Data    : {data_yaml}")
+    print(f"Epochs  : {epochs}")
     print("=" * 60)
 
-    model = YOLO(PRETRAINED_MODEL)
+    model = YOLO(pretrained_model)
 
     model.train(
-        data         = str(DATA_YAML),
-        epochs       = EPOCHS,
-        imgsz        = IMGSZ,
-        device       = DEVICE,
-        batch        = BATCH_SIZE,
-        project      = str(OUTPUT_DIR),
-        name         = "exp1_yolov8l_olddataset",
+        data         = str(data_yaml),
+        epochs       = epochs,
+        imgsz        = imgsz,
+        device       = device,
+        batch        = batch_size,
+        project      = str(output_dir),
+        name         = "exp_yolov8s_caries",
         save_period  = SAVE_PERIOD,
         exist_ok     = True,
         val          = True,
@@ -73,7 +78,7 @@ def main():
         plots        = True,
         amp          = True,
 
-        # ── Optimizer & Scheduler — sama dengan train_best_l2 ────────
+        # ── Optimizer & Scheduler Hyperparameters ───
         optimizer       = "AdamW",
         lr0             = 0.002,
         lrf             = 0.01,
@@ -83,11 +88,11 @@ def main():
         warmup_bias_lr  = 0.1,
         weight_decay    = 0.0005,
 
-        # ── Regularisasi — sama dengan train_best_l2 ─────────────────
+        # ── Regularization & Early Stopping ─────────
         dropout      = 0.0,
         patience     = 50,
 
-        # ── Augmentasi — sama dengan train_best_l2 ───────────────────
+        # ── Augmentation Settings ───────────────────
         fliplr       = 0.5,
         flipud       = 0.5,
         degrees      = 15,
@@ -104,20 +109,29 @@ def main():
         erasing      = 0.4,
     )
 
-    print("\n📊 Evaluasi model terbaik (best.pt)...")
+    print("\n📊 Evaluating best checkpoint (best.pt)...")
     metrics = model.val(
-        data   = str(DATA_YAML),
+        data   = str(data_yaml),
         split  = "val",
-        imgsz  = IMGSZ,
-        device = DEVICE,
-        batch  = BATCH_SIZE,
+        imgsz  = imgsz,
+        device = device,
+        batch  = batch_size,
     )
 
-    print("\n[done] Eksperimen 1 selesai.")
-    print(f"[done] Hasil di: {OUTPUT_DIR / 'exp1_yolo11l_olddataset'}")
-    print(f"📈 mAP50: {metrics.box.map50:.3f}, mAP50-95: {metrics.box.map:.3f}")
+    print("\n[Done] Model training and evaluation finished.")
+    print(f"[Done] Artifacts saved to: {output_dir / 'exp_yolov8s_caries'}")
+    if hasattr(metrics, "box"):
+        print(f"📈 Box mAP50: {metrics.box.map50:.3f}, mAP50-95: {metrics.box.map:.3f}")
+    if hasattr(metrics, "seg"):
+        print(f"📈 Mask mAP50: {metrics.seg.map50:.3f}, mAP50-95: {metrics.seg.map:.3f}")
+
+    return metrics
+
+
+def main():
+    """Entry point for training script execution."""
+    train_model()
 
 
 if __name__ == "__main__":
     main()
-

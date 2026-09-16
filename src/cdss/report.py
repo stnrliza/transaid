@@ -1,12 +1,24 @@
 """
-Pipeline lengkap CDSS:
-YOLOv8 → Query Builder → RAG → LLM → PDF laporan
+End-to-End Clinical Decision Support System (CDSS) Reporting Pipeline.
+
+This module orchestrates the complete diagnostic and reporting workflow:
+1. YOLOv8 Instance Segmentation: Detects secondary caries in Near-Infrared Light
+   Transillumination (NILT) dental images.
+2. Clinical Query Construction: Translates visual detections and practitioner input
+   (FDI tooth number, surface location) into structured clinical queries.
+3. Cross-Lingual RAG Retrieval: Translates queries to English and retrieves relevant
+   evidence-based dental literature from ChromaDB.
+4. LLM Report Synthesis: Uses a clinical LLM (e.g., Gemma, Qwen) to synthesize dual-audience
+   reports in Indonesian (clinician-facing and patient-facing).
+5. PDF Document Generation: Typesets a multi-page clinical report with side-by-side
+   image overlays, diagnostic interpretations, and tailored oral hygiene guidance.
 """
 
 import json
 import os
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 import chromadb
 from fpdf import FPDF
@@ -15,28 +27,108 @@ from PIL import Image
 from sentence_transformers import SentenceTransformer
 from ultralytics import YOLO
 
-# ── CONFIG ──────────────────────────────────────────
-YOLO_MODEL_PATH = "/home/guest/Workshop/skripsi-lija/others/skripsi/BAB_4/1.yolov8seg/Training/train_best_l2/weights/best.pt"       # ganti path
-CHROMA_PATH     = "./chroma_db/"
-COLLECTION_NAME = "karies_knowledge"
-OUTPUT_FOLDER   = "/home/guest/Workshop/skripsi-lija/cdss/outputs/03_reports/fix"
-OLLAMA_BASE_URL = "http://localhost:11434/v1"
-LLM_MODEL       = "gemma3:12b"
-TOP_K_CHUNKS    = 5
+# ── CONFIGURATION & ENVIRONMENT ─────────────────────
+BASE_DIR        = Path(__file__).resolve().parent
+YOLO_MODEL_PATH = os.getenv("YOLO_MODEL_PATH", str(BASE_DIR.parent / "yolo" / "weights" / "best.pt"))
+CHROMA_PATH     = Path(os.getenv("CHROMA_PATH", str(BASE_DIR / "chroma_db")))
+COLLECTION_NAME = os.getenv("COLLECTION_NAME", "karies_knowledge")
+OUTPUT_FOLDER   = Path(os.getenv("CDSS_OUTPUT_DIR", str(BASE_DIR / "outputs" / "reports")))
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
+LLM_MODEL       = os.getenv("LLM_MODEL", "gemma3:12b")
+LLM_API_KEY     = os.getenv("LLM_API_KEY", "ollama")
+TOP_K_CHUNKS    = int(os.getenv("TOP_K_CHUNKS", "5"))
 # ────────────────────────────────────────────────────
 
-os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+# Module-level component caches for lazy instantiation
+_yolo_model: Optional[YOLO] = None
+_embedder: Optional[SentenceTransformer] = None
+_chroma_client: Optional[chromadb.PersistentClient] = None
+_chroma_collection = None
+_llm_client: Optional[OpenAI] = None
 
-# Init semua komponen
-yolo_model  = YOLO(YOLO_MODEL_PATH)
-embedder    = SentenceTransformer("NeuML/pubmedbert-base-embeddings")
-chroma      = chromadb.PersistentClient(path=CHROMA_PATH)
-collection  = chroma.get_collection(COLLECTION_NAME)
-llm_client  = OpenAI(base_url=OLLAMA_BASE_URL, api_key="ollama")
+
+def get_yolo_model(model_path: str = YOLO_MODEL_PATH) -> YOLO:
+    """
+    Retrieve or lazily initialize the YOLOv8 segmentation model.
+
+    Args:
+        model_path: Path to the trained YOLO weights file (.pt).
+
+    Returns:
+        Loaded Ultralytics YOLO model instance.
+    """
+    global _yolo_model
+    if _yolo_model is None:
+        if not Path(model_path).exists():
+            raise FileNotFoundError(
+                f"YOLO model weights not found at: {model_path}. "
+                "Please configure YOLO_MODEL_PATH in your environment or .env file."
+            )
+        _yolo_model = YOLO(model_path)
+    return _yolo_model
+
+
+def get_embedder() -> SentenceTransformer:
+    """
+    Retrieve or lazily initialize the biomedical text embedding model.
+
+    Returns:
+        SentenceTransformer instance (NeuML/pubmedbert-base-embeddings).
+    """
+    global _embedder
+    if _embedder is None:
+        _embedder = SentenceTransformer("NeuML/pubmedbert-base-embeddings")
+    return _embedder
+
+
+def get_chroma_collection(chroma_path: Path = CHROMA_PATH,
+                          collection_name: str = COLLECTION_NAME):
+    """
+    Retrieve or lazily connect to the ChromaDB vector database collection.
+
+    Args:
+        chroma_path: Path to ChromaDB persistent storage directory.
+        collection_name: Name of the target vector collection.
+
+    Returns:
+        ChromaDB collection instance.
+    """
+    global _chroma_client, _chroma_collection
+    if _chroma_collection is None:
+        if _chroma_client is None:
+            _chroma_client = chromadb.PersistentClient(path=str(chroma_path))
+        _chroma_collection = _chroma_client.get_collection(collection_name)
+    return _chroma_collection
+
+
+def get_llm_client(base_url: str = OLLAMA_BASE_URL,
+                   api_key: str = LLM_API_KEY) -> OpenAI:
+    """
+    Retrieve or lazily initialize the OpenAI-compatible LLM client (Ollama/OpenAI).
+
+    Args:
+        base_url: Base endpoint URL for the inference server.
+        api_key: API authorization key.
+
+    Returns:
+        Configured OpenAI client instance.
+    """
+    global _llm_client
+    if _llm_client is None:
+        _llm_client = OpenAI(base_url=base_url, api_key=api_key)
+    return _llm_client
 
 
 def severity_label(confidence: float) -> str:
-    """Klasifikasikan tingkat keparahan berdasarkan confidence deteksi."""
+    """
+    Classify clinical severity based on YOLO detection confidence.
+
+    Args:
+        confidence: Detection confidence score between 0.0 and 1.0.
+
+    Returns:
+        Indonesian/English severity string: 'Tinggi (High)', 'Sedang (Moderate)', or 'Rendah (Low)'.
+    """
     if confidence >= 0.75:
         return "Tinggi (High)"
     elif confidence >= 0.5:
@@ -44,10 +136,10 @@ def severity_label(confidence: float) -> str:
     return "Rendah (Low)"
 
 
-# Lookup nama gigi dalam Bahasa Indonesia berdasarkan notasi FDI
-# Digunakan HANYA di laporan_pasien agar pasien memahami lokasi giginya
+# FDI tooth notation to Indonesian colloquial name mapping
+# Used exclusively in patient reports to ensure patients understand their tooth locations.
 FDI_TOOTH_NAME: dict[str, str] = {
-    # Kuadran 1 — Rahang atas kanan
+    # Quadrant 1 — Upper Right
     "11": "gigi seri pertama atas kanan",
     "12": "gigi seri kedua atas kanan",
     "13": "gigi taring atas kanan",
@@ -56,7 +148,7 @@ FDI_TOOTH_NAME: dict[str, str] = {
     "16": "gigi geraham pertama atas kanan",
     "17": "gigi geraham kedua atas kanan",
     "18": "gigi geraham bungsu atas kanan",
-    # Kuadran 2 — Rahang atas kiri
+    # Quadrant 2 — Upper Left
     "21": "gigi seri pertama atas kiri",
     "22": "gigi seri kedua atas kiri",
     "23": "gigi taring atas kiri",
@@ -65,7 +157,7 @@ FDI_TOOTH_NAME: dict[str, str] = {
     "26": "gigi geraham pertama atas kiri",
     "27": "gigi geraham kedua atas kiri",
     "28": "gigi geraham bungsu atas kiri",
-    # Kuadran 3 — Rahang bawah kiri
+    # Quadrant 3 — Lower Left
     "31": "gigi seri pertama bawah kiri",
     "32": "gigi seri kedua bawah kiri",
     "33": "gigi taring bawah kiri",
@@ -74,7 +166,7 @@ FDI_TOOTH_NAME: dict[str, str] = {
     "36": "gigi geraham pertama bawah kiri",
     "37": "gigi geraham kedua bawah kiri",
     "38": "gigi geraham bungsu bawah kiri",
-    # Kuadran 4 — Rahang bawah kanan
+    # Quadrant 4 — Lower Right
     "41": "gigi seri pertama bawah kanan",
     "42": "gigi seri kedua bawah kanan",
     "43": "gigi taring bawah kanan",
@@ -87,25 +179,45 @@ FDI_TOOTH_NAME: dict[str, str] = {
 
 
 def get_tooth_name(no_gigi: str) -> str:
-    """Kembalikan nama gigi dalam Bahasa Indonesia. Fallback ke nomor FDI jika tidak dikenal."""
+    """
+    Return descriptive Indonesian tooth name from FDI notation with fallback.
+
+    Args:
+        no_gigi: Two-digit FDI tooth notation string (e.g., '36').
+
+    Returns:
+        Colloquial Indonesian tooth name.
+    """
     return FDI_TOOTH_NAME.get(str(no_gigi).strip(), f"gigi {no_gigi}")
 
 
-# ── KOMPONEN 1: YOLOv8 ──────────────────────────────
-def run_yolo(image_path: str) -> dict:
-    """Jalankan inference YOLOv8 dan simpan hasil visualisasi."""
-    results = yolo_model(image_path)
+# ── COMPONENT 1: YOLOv8 INFERENCE ───────────────────
+def run_yolo(image_path: str, output_folder: Path = OUTPUT_FOLDER) -> dict:
+    """
+    Run YOLOv8 segmentation inference and save side-by-side visualization images.
+
+    Args:
+        image_path: Filesystem path to the input NILT dental image.
+        output_folder: Destination folder for output overlay images.
+
+    Returns:
+        Dictionary containing class_name, confidence, severity, vis_path, and orig_path.
+    """
+    model = get_yolo_model()
+    output_folder.mkdir(parents=True, exist_ok=True)
+
+    results = model(image_path)
     result  = results[0]
 
-    # Simpan salinan citra original untuk perbandingan side-by-side
-    orig_path = os.path.join(OUTPUT_FOLDER, "yolo_original.jpg")
+    # Save copy of original image for side-by-side comparison
+    orig_path = str(output_folder / "yolo_original.jpg")
     Image.open(image_path).convert("RGB").save(orig_path)
 
-    # Simpan gambar dengan mask segmentasi
-    vis_path = os.path.join(OUTPUT_FOLDER, "yolo_result.jpg")
+    # Save segmentation mask overlay
+    vis_path = str(output_folder / "yolo_result.jpg")
     result.save(filename=vis_path)
 
-    # Ambil deteksi pertama (asumsi 1 lesi per foto)
+    # Extract primary detection (assuming one lesion per cropped tooth image)
     if len(result.boxes) == 0:
         return {
             "class_name": None,
@@ -118,7 +230,7 @@ def run_yolo(image_path: str) -> dict:
     box        = result.boxes[0]
     class_id   = int(box.cls[0])
     confidence = float(box.conf[0])
-    class_name = yolo_model.names[class_id]
+    class_name = model.names[class_id]
 
     return {
         "class_name":  class_name,
@@ -129,16 +241,30 @@ def run_yolo(image_path: str) -> dict:
     }
 
 
-# ── KOMPONEN 2: Query Builder ────────────────────────
+# ── COMPONENT 2: QUERY BUILDER ──────────────────────
 def get_manual_input() -> dict:
-    """Input manual dokter via terminal (nomor gigi + lokasi lesi)."""
-    no_gigi = input("Nomor gigi (notasi FDI, 11-48): ").strip()
-    lokasi  = input("Lokasi lesi (mesial/distal/oklusal/servikal/bukal/lingual): ").strip().lower()
+    """
+    Prompt dentist for manual clinical metadata via interactive terminal.
+
+    Returns:
+        Dictionary with keys 'no_gigi' (FDI notation) and 'lokasi' (lesion surface).
+    """
+    no_gigi = input("Tooth number (FDI notation, 11-48): ").strip()
+    lokasi  = input("Lesion location / surface (mesial/distal/oklusal/servikal/bukal/lingual): ").strip().lower()
     return {"no_gigi": no_gigi, "lokasi": lokasi}
 
 
 def build_query(detection: dict, manual: dict) -> str:
-    """Konversi output YOLO + input manual dokter ke kalimat klinis untuk RAG query."""
+    """
+    Synthesize YOLO detection output and manual clinical metadata into a clinical query.
+
+    Args:
+        detection: Detection result dictionary from run_yolo.
+        manual: Practitioner input dictionary with tooth number and surface.
+
+    Returns:
+        Formatted clinical query sentence in Indonesian.
+    """
     if detection is None or detection.get("class_name") is None:
         return build_query_healthy(manual)
 
@@ -166,7 +292,15 @@ def build_query(detection: dict, manual: dict) -> str:
 
 
 def build_query_healthy(manual: dict) -> str:
-    """Query string untuk kasus gigi sehat (tidak ada deteksi karies)."""
+    """
+    Construct clinical query string for healthy teeth without detected caries.
+
+    Args:
+        manual: Practitioner input dictionary with tooth number and surface.
+
+    Returns:
+        Formatted clinical query sentence in Indonesian for healthy findings.
+    """
     tooth_name = get_tooth_name(manual["no_gigi"])
     return (
         f"Tidak terdeteksi karies sekunder pada {tooth_name} (gigi {manual['no_gigi']}) "
@@ -176,9 +310,18 @@ def build_query_healthy(manual: dict) -> str:
 
 
 def translate_query_to_english(query: str) -> str:
-    """Translate Indonesian CDSS query to English for optimal biomedical retrieval."""
+    """
+    Translate an Indonesian clinical query into an English query optimized for PubMedBERT retrieval.
+
+    Args:
+        query: Clinical query string in Indonesian.
+
+    Returns:
+        Optimized English search query.
+    """
+    client = get_llm_client()
     try:
-        response = llm_client.chat.completions.create(
+        response = client.chat.completions.create(
             model=LLM_MODEL,
             messages=[
                 {
@@ -204,22 +347,34 @@ def translate_query_to_english(query: str) -> str:
         translated = translated.replace('"', '').replace("'", "").strip()
         return translated
     except Exception as e:
-        print(f"      [Warning] Translation failed: {e}. Using original query.")
+        print(f"      [Warning] Query translation failed: {e}. Falling back to original query.")
         return query
 
 
-# ── KOMPONEN 3: RAG Retrieval ────────────────────────
-def retrieve_context(query: str) -> list[str]:
-    """Ambil Top-K chunks paling relevan dari ChromaDB."""
+# ── COMPONENT 3: RAG RETRIEVAL ──────────────────────
+def retrieve_context(query: str, top_k: int = TOP_K_CHUNKS) -> list[str]:
+    """
+    Retrieve Top-K most relevant document chunks from ChromaDB knowledge base.
+
+    Args:
+        query: Semantic query text in English.
+        top_k: Number of chunks to retrieve.
+
+    Returns:
+        List of text chunks from relevant dental journals.
+    """
+    embedder = get_embedder()
+    collection = get_chroma_collection()
+
     query_embedding = embedder.encode([query]).tolist()
     results = collection.query(
         query_embeddings=query_embedding,
-        n_results=TOP_K_CHUNKS
+        n_results=top_k
     )
     return results["documents"][0]
 
 
-# ── KOMPONEN 4: LLM Generation ──────────────────────
+# ── COMPONENT 4: LLM REPORT GENERATION ──────────────
 SYSTEM_PROMPT = """Kamu adalah sistem CDSS untuk dokter gigi.
 Gunakan referensi klinis yang diberikan untuk membuat laporan akurat.
 
@@ -356,11 +511,22 @@ Respond HANYA dalam format JSON berikut, tanpa teks tambahan, tanpa markdown cod
   }
 }"""
 
+
 def generate_report(query: str, context_chunks: list[str]) -> dict:
-    """Generate laporan dokter + pasien via LLM dengan konteks RAG."""
+    """
+    Generate dual-audience clinical reports (dentist & patient) using LLM with RAG context.
+
+    Args:
+        query: Clinical query string describing the detected case.
+        context_chunks: Evidence-based literature passages retrieved from ChromaDB.
+
+    Returns:
+        Parsed JSON dictionary containing 'laporan_dokter' and 'laporan_pasien'.
+    """
+    client = get_llm_client()
     context = "\n\n---\n\n".join(context_chunks)
 
-    response = llm_client.chat.completions.create(
+    response = client.chat.completions.create(
         model=LLM_MODEL,
         messages=[
             {
@@ -382,17 +548,26 @@ def generate_report(query: str, context_chunks: list[str]) -> dict:
     )
 
     raw = response.choices[0].message.content
-    # Bersihkan kalau ada markdown code block
-    raw = raw.replace("", "").strip()
+    # Strip markdown fences if emitted by model
+    raw = raw.replace("```json", "").replace("```", "").strip()
     return json.loads(raw)
 
 
 def generate_healthy_report_static(no_gigi: str, lokasi: str) -> dict:
-    """Generate laporan statis untuk kasus gigi sehat (tanpa LLM call)."""
+    """
+    Generate deterministic clinical report for healthy teeth without requiring an LLM call.
+
+    Args:
+        no_gigi: FDI tooth number string.
+        lokasi: Tooth surface inspected.
+
+    Returns:
+        Dictionary containing static 'laporan_dokter' and 'laporan_pasien' objects.
+    """
     tooth_name  = get_tooth_name(no_gigi)
     lokasi_norm = lokasi.lower()
 
-    # Saran kebersihan spesifik berdasarkan lokasi lesi
+    # Oral hygiene recommendations tailored to tooth surface
     if lokasi_norm in ("mesial", "distal"):
         hygiene_tip = (
             "Penggunaan benang gigi (dental floss) setiap hari sangat "
@@ -458,43 +633,51 @@ def generate_healthy_report_static(no_gigi: str, lokasi: str) -> dict:
     }
 
 
-# ── KOMPONEN 5: PDF Generator ────────────────────────
-# Palet warna mengikuti referensi laporan_cdss_sample.pdf
-NAVY        = (21, 67, 96)      # header / label kolom kiri (gelap)
-NAVY_LIGHT  = (52, 110, 145)    # label kolom kanan (lebih terang)
-GREEN_DARK  = (39, 116, 84)     # header "Laporan Pasien"
-GREEN_LIGHT = (236, 247, 241)   # background box pasien
-GRAY_LIGHT  = (240, 240, 240)   # background info box dokter
+# ── COMPONENT 5: PDF GENERATOR ──────────────────────
+# Color palette matching clinical sample specifications
+NAVY        = (21, 67, 96)      # Primary header / dark column labels
+NAVY_LIGHT  = (52, 110, 145)    # Secondary column labels
+GREEN_DARK  = (39, 116, 84)     # Patient report header
+GREEN_LIGHT = (236, 247, 241)   # Patient report background card
+GRAY_LIGHT  = (240, 240, 240)   # Clinician info box background
 TEXT_DARK   = (40, 40, 40)
 GRAY_TEXT   = (110, 110, 110)
 
 
-def _section_row(pdf, label, text, fill_color):
-    """Satu baris label (kiri, berwarna) + isi (kanan, multi-baris)."""
+def _section_row(pdf: FPDF, label: str, text: str, fill_color: tuple) -> None:
+    """
+    Render a two-column section row with a colored label badge on the left and body text on the right.
+
+    Args:
+        pdf: FPDF instance.
+        label: Badge label string.
+        text: Multiline body text.
+        fill_color: RGB tuple for the label background.
+    """
     label_w = 38
     page_w  = pdf.w - pdf.l_margin - pdf.r_margin
     text_w  = page_w - label_w
 
     start_y = pdf.get_y()
 
-    # Hitung tinggi konten dulu TANPA menggambar (dry_run, fpdf2 >= 2.7)
+    # Pre-calculate content height without rendering (dry_run)
     pdf.set_xy(pdf.l_margin + label_w, start_y)
     pdf.set_font("Helvetica", size=10.5)
     measured_h = pdf.multi_cell(text_w, 5.5, text, dry_run=True, output="HEIGHT")
     row_h = max(measured_h, 10)
 
-    # Gambar background label
+    # Draw colored badge background
     pdf.set_fill_color(*fill_color)
     pdf.rect(pdf.l_margin, start_y, label_w, row_h, style="F")
 
-    # Tulis label (putih, bold), dicentang vertikal sederhana
+    # Write badge text (white, bold) centered vertically
     pdf.set_text_color(255, 255, 255)
     pdf.set_font("Helvetica", "B", 9.5)
     n_lines = max(1, round(row_h / 6))
     pdf.set_xy(pdf.l_margin, start_y + (row_h - n_lines * 5) / 2)
     pdf.multi_cell(label_w, 5, label, align="L")
 
-    # Tulis isi teks (satu kali saja)
+    # Write section content text
     pdf.set_xy(pdf.l_margin + label_w, start_y)
     pdf.set_text_color(*TEXT_DARK)
     pdf.set_font("Helvetica", size=10.5)
@@ -506,15 +689,32 @@ def _section_row(pdf, label, text, fill_color):
 
 
 def generate_pdf(detection: dict, report: dict, query: str,
-                  patient_name: str = "-", tooth: str = "-", lokasi: str = "-",
-                  report_no: str = None, is_healthy: bool = False) -> str:
-    """Generate PDF laporan rapi (mengikuti template laporan_cdss_sample.pdf)."""
+                 patient_name: str = "-", tooth: str = "-", lokasi: str = "-",
+                 report_no: str = None, is_healthy: bool = False,
+                 output_folder: Path = OUTPUT_FOLDER) -> str:
+    """
+    Typeset and generate a formatted multi-page clinical PDF report.
+
+    Args:
+        detection: YOLOv8 detection metadata dictionary.
+        report: Dual-audience report dictionary ('laporan_dokter' & 'laporan_pasien').
+        query: Formulated clinical query string.
+        patient_name: Patient identifier.
+        tooth: FDI tooth number.
+        lokasi: Lesion surface.
+        report_no: Unique clinical report identifier.
+        is_healthy: Boolean flag indicating healthy tooth finding.
+        output_folder: Destination filesystem directory.
+
+    Returns:
+        Filesystem path to the generated PDF document.
+    """
+    output_folder.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     if is_healthy:
-        pdf_path = os.path.join(OUTPUT_FOLDER,
-                                f"laporan_healthy_gigi{tooth}_{lokasi}_{timestamp}.pdf")
+        pdf_path = str(output_folder / f"laporan_healthy_gigi{tooth}_{lokasi}_{timestamp}.pdf")
     else:
-        pdf_path = os.path.join(OUTPUT_FOLDER, f"laporan_{timestamp}.pdf")
+        pdf_path = str(output_folder / f"laporan_{timestamp}.pdf")
     if report_no is None:
         report_no = f"NILT-{datetime.now().strftime('%Y%m%d')}-{timestamp[-4:]}"
 
@@ -522,7 +722,7 @@ def generate_pdf(detection: dict, report: dict, query: str,
     pdf.set_auto_page_break(auto=True, margin=15)
     pdf.add_page()
 
-    # ── Header ──
+    # ── Page 1: Clinician Report Header ──
     pdf.set_font("Helvetica", "B", 18)
     pdf.set_text_color(*NAVY)
     pdf.cell(0, 9, "LAPORAN KLINIS CDSS", ln=True)
@@ -530,7 +730,7 @@ def generate_pdf(detection: dict, report: dict, query: str,
     pdf.set_text_color(*GRAY_TEXT)
     pdf.cell(0, 6, "Clinical Decision Support System NILT Caries Detection", ln=True)
 
-    # No & tanggal di kanan atas (ditulis di posisi sebelumnya)
+    # Date and Report Number in upper right corner
     pdf.set_xy(pdf.w - pdf.r_margin - 60, 12)
     pdf.set_font("Helvetica", size=9)
     pdf.set_text_color(*GRAY_TEXT)
@@ -542,7 +742,7 @@ def generate_pdf(detection: dict, report: dict, query: str,
     pdf.line(pdf.l_margin, 26, pdf.w - pdf.r_margin, 26)
     pdf.ln(8)
 
-    # ── Info Deteksi ──
+    # ── Detection Summary Box ──
     pdf.set_font("Helvetica", "B", 12)
     pdf.set_text_color(*NAVY)
     pdf.cell(0, 7, "INFORMASI DETEKSI", ln=True)
@@ -580,7 +780,7 @@ def generate_pdf(detection: dict, report: dict, query: str,
     pdf.set_xy(pdf.l_margin, y_start + 24)
     pdf.ln(3)
 
-    # ── Gambar: original vs hasil segmentasi side-by-side ──
+    # ── Side-by-side Images: Original NILT vs. Segmentation ──
     if detection.get("vis_path"):
         pdf.set_font("Helvetica", "B", 12)
         pdf.set_text_color(*NAVY)
@@ -591,19 +791,16 @@ def generate_pdf(detection: dict, report: dict, query: str,
         img_y  = pdf.get_y()
         orig_path = detection.get("orig_path", detection["vis_path"])
 
-        # Hitung tinggi gambar, batasi agar laporan dokter muat 1 halaman
         with Image.open(orig_path) as _im:
             img_h = img_w * _im.height / _im.width
-        MAX_IMG_H = 70  # mm — batas agar konten + gambar muat 1 halaman
+        MAX_IMG_H = 70  # Constrain image height to fit onto a single page
         if img_h > MAX_IMG_H:
-            # Scale down: gunakan h sebagai constraint, hitung w proporsional
             scale = MAX_IMG_H / img_h
             img_w_actual = img_w * scale
             img_h = MAX_IMG_H
         else:
             img_w_actual = img_w
 
-        # Offset untuk centering gambar di dalam kolom masing-masing
         img_offset = (col_w - img_w_actual) / 2
 
         pdf.set_font("Helvetica", "B", 9)
@@ -625,7 +822,7 @@ def generate_pdf(detection: dict, report: dict, query: str,
                  ln=True, align="C")
         pdf.ln(4)
 
-    # ── Laporan Dokter ──
+    # ── Clinician Sections ──
     pdf.set_font("Helvetica", "B", 12)
     pdf.set_text_color(*NAVY)
     pdf.cell(0, 8, "LAPORAN KLINIS - UNTUK DOKTER GIGI", ln=True)
@@ -644,7 +841,7 @@ def generate_pdf(detection: dict, report: dict, query: str,
         "YOLOv8 + RAG + LLM. Tidak menggantikan diagnosis klinis oleh "
         "tenaga medis profesional.")
 
-    # ── Laporan Pasien (halaman baru) ──
+    # ── Page 2: Patient-facing Report ──
     pdf.add_page()
     pdf.set_font("Helvetica", "B", 18)
     pdf.set_text_color(*NAVY)
@@ -660,7 +857,7 @@ def generate_pdf(detection: dict, report: dict, query: str,
     pdf.line(pdf.l_margin, 26, pdf.w - pdf.r_margin, 26)
     pdf.ln(8)
 
-    # ── Info Deteksi (ringkas, versi pasien) ──
+    # Detection Info (Patient Version)
     pdf.set_font("Helvetica", "B", 12)
     pdf.set_text_color(*NAVY)
     pdf.cell(0, 7, "INFORMASI DETEKSI", ln=True)
@@ -692,7 +889,7 @@ def generate_pdf(detection: dict, report: dict, query: str,
     pdf.set_xy(pdf.l_margin, y_start + 22)
     pdf.ln(3)
 
-    # ── Gambar: original vs hasil segmentasi side-by-side (halaman pasien) ──
+    # Side-by-side images on patient page
     if detection.get("vis_path"):
         pdf.set_font("Helvetica", "B", 12)
         pdf.set_text_color(*NAVY)
@@ -703,10 +900,9 @@ def generate_pdf(detection: dict, report: dict, query: str,
         img_y  = pdf.get_y()
         orig_path = detection.get("orig_path", detection["vis_path"])
 
-        # Hitung tinggi gambar, batasi agar laporan pasien muat 1 halaman
         with Image.open(orig_path) as _im:
             img_h = img_w * _im.height / _im.width
-        MAX_IMG_H = 70  # mm — batas agar konten + gambar muat 1 halaman
+        MAX_IMG_H = 70
         if img_h > MAX_IMG_H:
             scale = MAX_IMG_H / img_h
             img_w_actual = img_w * scale
@@ -714,7 +910,6 @@ def generate_pdf(detection: dict, report: dict, query: str,
         else:
             img_w_actual = img_w
 
-        # Offset untuk centering gambar di dalam kolom masing-masing
         img_offset = (col_w - img_w_actual) / 2
 
         pdf.set_font("Helvetica", "B", 9)
@@ -728,7 +923,6 @@ def generate_pdf(detection: dict, report: dict, query: str,
         pdf.image(detection["vis_path"], x=pdf.l_margin + col_w + img_offset, y=img_y + 6, w=img_w_actual)
 
         pdf.set_y(img_y + 6 + img_h + 3)
-
         pdf.set_font("Helvetica", "I", 8.5)
         pdf.set_text_color(*GRAY_TEXT)
         pdf.cell(0, 6,
@@ -737,6 +931,7 @@ def generate_pdf(detection: dict, report: dict, query: str,
                  ln=True, align="C")
         pdf.ln(4)
 
+    # Patient Narrative Cards
     pdf.set_font("Helvetica", "B", 12)
     pdf.set_text_color(*GREEN_DARK)
     pdf.cell(0, 7, "LAPORAN UNTUK PASIEN", ln=True)
@@ -744,13 +939,13 @@ def generate_pdf(detection: dict, report: dict, query: str,
 
     pasien = report["laporan_pasien"]
     for label, key in [("Apa yang ditemukan?", "ringkasan"),
-                        ("Apa yang perlu dilakukan?", "saran")]:
+                       ("Apa yang perlu dilakukan?", "saran")]:
         box_y = pdf.get_y()
         page_w = pdf.w - pdf.l_margin - pdf.r_margin
         pdf.set_xy(pdf.l_margin + 3, box_y + 8)
         pdf.set_font("Helvetica", size=10.5)
         text_h = pdf.multi_cell(page_w - 6, 5.5, pasien[key],
-                                 dry_run=True, output="HEIGHT")
+                                dry_run=True, output="HEIGHT")
         box_h = text_h + 10
 
         pdf.set_fill_color(*GREEN_LIGHT)
@@ -773,60 +968,69 @@ def generate_pdf(detection: dict, report: dict, query: str,
     return pdf_path
 
 
-# ── MAIN ─────────────────────────────────────────────
-def run(image_path: str):
+# ── MAIN PIPELINE EXECUTION ──────────────────────────
+def run(image_path: str, output_folder: Path = OUTPUT_FOLDER) -> dict:
+    """
+    Execute the full end-to-end CDSS pipeline on an input image.
+
+    Args:
+        image_path: Filesystem path to the NILT input image.
+        output_folder: Destination folder for output artifacts (PDF, JSON, overlays).
+
+    Returns:
+        Dictionary containing detection, manual metadata, query, contexts, report, and pdf_path.
+    """
+    output_folder.mkdir(parents=True, exist_ok=True)
     print(f"\n{'='*50}")
     print(f"Input: {image_path}")
 
-    print("[1/5] Menjalankan YOLOv8...")
-    detection = run_yolo(image_path)
+    print("[1/5] Running YOLOv8 segmentation inference...")
+    detection = run_yolo(image_path, output_folder=output_folder)
 
     is_healthy = (detection.get("class_name") is None)
 
     if is_healthy:
-        print("      Tidak ada deteksi karies — kasus gigi sehat.")
+        print("      No caries detected — healthy tooth case.")
     else:
-        print(f"      Deteksi: {detection['class_name']} ({detection['confidence']*100:.1f}%)")
+        print(f"      Detected: {detection['class_name']} ({detection['confidence']*100:.1f}%)")
 
-    print("[2/5] Input manual dokter (nomor gigi & lokasi lesi)...")
+    print("[2/5] Collecting clinician input (tooth number & lesion location)...")
     manual = get_manual_input()
 
-    print("[3/5] Membangun query dan retrieval RAG...")
+    print("[3/5] Constructing clinical query and retrieving RAG context...")
     query = build_query(detection, manual)
 
     if is_healthy:
-        # Kasus gigi sehat: gunakan template statis, skip RAG & LLM
+        # Healthy cases use deterministic template; bypass RAG retrieval and LLM call
         chunks = []
-        print("      Kasus sehat — menggunakan template statis.")
-        print("[4/5] Generating laporan (template statis)...")
+        print("      Healthy case — using deterministic clinical template.")
+        print("[4/5] Generating reports (static template)...")
         report = generate_healthy_report_static(manual["no_gigi"], manual["lokasi"])
-        # detection sudah memiliki vis_path dan orig_path dari run_yolo
     else:
-        # Translate query to English for optimal biomedical retrieval (cross-lingual RAG)
-        print("      Translating query to English for RAG retrieval...")
+        # Cross-lingual RAG: translate query to English for biomedical retrieval
+        print("      Translating query to English for PubMedBERT retrieval...")
         english_query = translate_query_to_english(query)
         print(f"      Indonesian Query: {query}")
         print(f"      English Query:    {english_query}")
-        
+
         chunks = retrieve_context(english_query)
-        print(f"      {len(chunks)} chunks ditemukan dari knowledge base")
-        print("[4/5] Generating laporan via LLM...")
+        print(f"      {len(chunks)} relevant chunks retrieved from knowledge base")
+        print("[4/5] Generating clinical reports via LLM...")
         report = generate_report(query, chunks)
 
-    print("      Laporan berhasil digenerate ✅")
+    print("      Reports generated successfully ✅")
 
-    print("[5/5] Generating PDF...")
+    print("[5/5] Generating PDF report...")
     pdf_path = generate_pdf(detection, report, query,
-                             tooth=manual["no_gigi"], lokasi=manual["lokasi"],
-                             is_healthy=is_healthy)
-    print(f"      PDF tersimpan: {pdf_path}")
+                            tooth=manual["no_gigi"], lokasi=manual["lokasi"],
+                            is_healthy=is_healthy, output_folder=output_folder)
+    print(f"      PDF saved: {pdf_path}")
 
-    # Simpan hasil pipeline ke JSON untuk evaluasi (04_evaluate.py)
+    # Persist structured execution metadata to JSON for offline evaluation
     if is_healthy:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        json_path = os.path.join(
-            OUTPUT_FOLDER,
-            f"laporan_healthy_gigi{manual['no_gigi']}_{manual['lokasi']}_{timestamp}.json"
+        json_path = str(
+            output_folder / f"laporan_healthy_gigi{manual['no_gigi']}_{manual['lokasi']}_{timestamp}.json"
         )
     else:
         json_path = pdf_path.replace(".pdf", ".json")
@@ -845,7 +1049,7 @@ def run(image_path: str):
                 "severity":    detection.get("severity"),
             }
         }, f, ensure_ascii=False, indent=2)
-    print(f"      JSON tersimpan: {json_path}")
+    print(f"      JSON saved: {json_path}")
 
     print(f"{'='*50}\n")
     return {
@@ -858,8 +1062,14 @@ def run(image_path: str):
     }
 
 
-def generate_healthy_reports():
-    """Generate 5 laporan gigi sehat sesuai tabel di report_revision_guide.md (Part 3)."""
+def generate_healthy_reports(output_folder: Path = OUTPUT_FOLDER) -> None:
+    """
+    Batch generate standard healthy control case reports and evaluation sidecars.
+
+    Args:
+        output_folder: Destination folder for output JSON sidecars.
+    """
+    output_folder.mkdir(parents=True, exist_ok=True)
     healthy_cases = [
         {"no_gigi": "46", "lokasi": "oklusal"},
         {"no_gigi": "26", "lokasi": "oklusal"},
@@ -869,32 +1079,20 @@ def generate_healthy_reports():
     ]
 
     print(f"\n{'='*50}")
-    print(f"Generating {len(healthy_cases)} laporan gigi sehat...")
+    print(f"Batch generating {len(healthy_cases)} healthy tooth reports...")
     print(f"{'='*50}")
 
     for i, case in enumerate(healthy_cases, 1):
         no_gigi = case["no_gigi"]
         lokasi  = case["lokasi"]
-        print(f"\n[{i}/{len(healthy_cases)}] Gigi {no_gigi} - {lokasi}")
+        print(f"\n[{i}/{len(healthy_cases)}] Tooth {no_gigi} - {lokasi}")
 
         report = generate_healthy_report_static(no_gigi, lokasi)
         query  = build_query_healthy({"no_gigi": no_gigi, "lokasi": lokasi})
 
-        # Detection dict minimal untuk batch generation, bisa saja vis_path = None
-        # karena tidak ada citra asli untuk batch command ini
-        detection = {
-            "class_name": None,
-            "confidence": None,
-            "severity":   None,
-            "vis_path":   None,
-            "orig_path":  None,
-        }
-
-        # Simpan JSON
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        json_path = os.path.join(
-            OUTPUT_FOLDER,
-            f"laporan_healthy_gigi{no_gigi}_{lokasi}_{timestamp}.json"
+        json_path = str(
+            output_folder / f"laporan_healthy_gigi{no_gigi}_{lokasi}_{timestamp}.json"
         )
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump({
@@ -908,10 +1106,10 @@ def generate_healthy_reports():
                     "severity":   None,
                 },
             }, f, ensure_ascii=False, indent=2)
-        print(f"      JSON tersimpan: {json_path}")
+        print(f"      JSON saved: {json_path}")
 
     print(f"\n{'='*50}")
-    print(f"Selesai — {len(healthy_cases)} laporan gigi sehat berhasil digenerate.")
+    print(f"Done — {len(healthy_cases)} healthy reports generated.")
     print(f"{'='*50}\n")
 
 

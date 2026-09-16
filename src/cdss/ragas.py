@@ -1,49 +1,25 @@
 """
-04_ragas.py — RAGAS-style (reference-free) evaluation for NILT CDSS reports.
+RAGAS-Inspired (Reference-Free) Evaluation for NILT CDSS Reports.
 
-Evaluates the laporan_dokter produced by 03_pipeline.py using four
-reference-free metrics modelled after RAGAS:
+Evaluates dentist-facing reports (laporan_dokter) produced by the CDSS pipeline
+using four reference-free metrics adapted from the RAGAS framework:
 
-  - faithfulness      : are claims in the report grounded in the retrieved
-                        contexts OR in the LLM's parametric dental knowledge?
-                        (mirrors RAGAS Faithfulness — adapted for CDSS context)
-  - answer_relevancy  : does the report directly address the detection query?
-                        (mirrors RAGAS AnswerRelevancy)
-  - context_precision : are the retrieved context chunks useful for this case?
-                        (mirrors RAGAS LLMContextPrecisionWithoutReference)
-                        Skipped automatically when contexts=[] (healthy cases).
-  - context_recall    : how completely did retrieval find the information needed
-                        to answer the query? Measures retrieval completeness.
-                        (mirrors RAGAS ContextRecall — reference-free adaptation)
-                        Skipped automatically when contexts=[] (healthy cases).
+  - Faithfulness      : Are factual claims in the report grounded either in the
+                        retrieved literature contexts or in established dental clinical knowledge?
+  - Answer Relevancy  : Does the report directly and comprehensively address the detection query?
+  - Context Precision : Are the retrieved literature chunks useful and relevant to this specific case?
+                        (Automatically skipped for healthy cases where contexts are empty by design).
+  - Context Recall    : How completely did retrieval locate the necessary evidence to support the case?
+                        (Automatically skipped for healthy cases).
 
-Each metric is evaluated by prompting Qwen3:14b directly via Ollama's
-/api/generate endpoint — identical to the approach in 05_geval.py.
-
-CATATAN METODOLOGI (untuk Bab 4 / Bab 5):
-- Faithfulness: Sistem CDSS ini secara sengaja menggunakan LLM untuk mengisi
-  celah yang tidak tertutup oleh KB (mis. istilah NILT, confidence threshold,
-  protokol severity). Oleh karena itu, metric faithfulness di sini mengukur
-  apakah klaim dalam laporan dapat dibenarkan secara klinis — baik dari konteks
-  yang diambil maupun dari pengetahuan dental umum yang valid. Ini berbeda dari
-  definisi RAGAS asli yang mengukur grounding ke konteks saja.
-- Context precision: Skor rendah mengindikasikan masalah pada retrieval KB
-  (cross-lingual query/embedding mismatch), bukan pada kualitas laporan.
-  Judge diarahkan untuk menilai relevansi topik secara konseptual, bukan
-  pencocokan frasa eksak "karies sekunder".
-- Context recall: Mengukur kelengkapan retrieval — sejauh mana informasi yang
-  dibutuhkan untuk menjawab query berhasil ditemukan. Judge menggunakan 4 topik
-  kunci tetap dengan tabel konversi skor eksplisit untuk konsistensi.
-  Skor rendah menunjukkan retriever gagal mengambil chunk yang klinically relevan.
-- Kasus healthy (contexts=[]): context_precision dan context_recall di-skip (N/A)
-  karena tidak ada konteks yang diambil — by design, bukan error.
-
-Judge LLM : Qwen3:14b via local Ollama — same as 05_geval.py
-Output    : per-report sidecar JSON  (<report_id>_ragas.json)
-          + aggregate CSV            (ragas_scores.csv)
-
-Run:
-    conda run -n skripsi-lija python 04_ragas.py
+Methodological Notes:
+- Faithfulness: The CDSS pipeline utilizes the LLM's parametric medical knowledge
+  (e.g., NILT transillumination principles, confidence thresholds, severity stratification)
+  that may not appear verbatim in literature chunks. Therefore, faithfulness verifies
+  clinical validity against either retrieved context or established dental domain standards.
+- Context Precision & Recall: Evaluates topical overlap with clinical concepts
+  (e.g., ICDAS staging, radiolucency grading, intervention criteria) without requiring
+  exact phrase matches for 'secondary caries'.
 """
 
 import csv
@@ -55,65 +31,27 @@ import re
 import sys
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 import requests
 
+# ── CONFIGURATION & ENVIRONMENT ─────────────────────
+BASE_DIR            = Path(__file__).resolve().parent
+OLLAMA_BASE_URL     = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+JUDGE_MODEL         = os.getenv("JUDGE_MODEL", "qwen3:14b")
+INPUT_DIR           = Path(os.getenv("RAGAS_INPUT_DIR", str(BASE_DIR / "outputs" / "reports")))
+OUTPUT_DIR          = Path(os.getenv("RAGAS_OUTPUT_DIR", str(BASE_DIR / "outputs" / "ragas")))
+REPORT_PATTERN      = os.getenv("REPORT_PATTERN", "laporan_*.json")
+SLEEP_BETWEEN_CALLS = float(os.getenv("SLEEP_BETWEEN_CALLS", "1.0"))
+SKIP_EXISTING       = os.getenv("SKIP_EXISTING", "True").lower() in ("true", "1", "yes")
+MAX_CONTEXT_CHUNKS  = int(os.getenv("MAX_CONTEXT_CHUNKS", "5"))
+# ────────────────────────────────────────────────────
 
-# --------------------------------------------------------------------------- #
-# Config — edit here, no CLI needed
-# --------------------------------------------------------------------------- #
-
-OLLAMA_BASE_URL     = "http://localhost:11434"
-JUDGE_MODEL         = "qwen3:14b"
-INPUT_DIR           = "/home/guest/Workshop/skripsi-lija/cdss/outputs/03_reports/fix"
-OUTPUT_DIR          = "/home/guest/Workshop/skripsi-lija/cdss/outputs/04_ragas/fix"
-REPORT_PATTERN      = "laporan_*.json"
-SLEEP_BETWEEN_CALLS = 1.0   # seconds between each judge call (local Ollama, no rate limit)
-SKIP_EXISTING       = True  # set False to re-score reports that already have a sidecar
-
-# Number of context chunks to show to the judge.
-# Keep at 5 — enough for precision ranking without overflowing Qwen3's context.
-MAX_CONTEXT_CHUNKS  = 5
-
-
-# --------------------------------------------------------------------------- #
-# Metric definitions (G-Eval form-filling style, same as 05_geval.py)
-#
-# KEY DESIGN DECISIONS:
-#
-# 1. Faithfulness prompt revised: CDSS laporan_dokter is generated by a medical
-#    LLM that legitimately contributes parametric dental knowledge (NILT imaging
-#    interpretation, severity thresholds, standard protocols) that will NOT
-#    appear verbatim in the retrieved KB chunks. Penalising this as
-#    "hallucination" was producing unfair 1/5 scores for every report. The
-#    revised criterion distinguishes between:
-#      - Supported claims: traceable to KB chunks OR consistent with
-#        established dental clinical knowledge.
-#      - True hallucinations: claims that contradict the detection input,
-#        invent tooth numbers/surfaces, or make unsupported clinical assertions
-#        that a dental clinician would consider incorrect.
-#
-# 2. Context precision prompt revised: Explicitly enumerates which topic
-#    categories count as relevant (ICDAS staging, radiolucency grading,
-#    surface lesion descriptions, detection techniques, management criteria)
-#    so the judge does not penalise chunks for lacking the exact phrase
-#    "karies sekunder". Topical overlap is sufficient for relevance.
-#
-# 3. Context recall prompt revised: Replaces vague 3-5 topic enumeration with
-#    4 fixed concrete topics and a hard-coded score conversion table
-#    (4 topics = 5, 3 = 4, 2 = 3, 1 = 2, 0 = 1). Explicitly instructs the
-#    judge to award coverage for conceptual overlap, not verbatim term match.
-#    This fixes the CR=1 misfire where chunk 4 (radiographic staging) was not
-#    credited because it didn't say "protokol manajemen" literally.
-#
-# 4. Healthy-case handling: context_precision and context_recall are skipped
-#    (scored None / N/A) when contexts=[] because there are no chunks to
-#    evaluate. The pipeline intentionally skips RAG for healthy cases.
-# --------------------------------------------------------------------------- #
 
 @dataclass
 class Criterion:
+    """Evaluation criterion structure with detailed evaluation instructions."""
     name: str
     description: str
     evaluation_steps: list[str]
@@ -260,13 +198,8 @@ RAGAS_CRITERIA: list[Criterion] = [
 METRIC_KEYS = [c.name for c in RAGAS_CRITERIA]
 CONTEXT_PRECISION_KEY = "context_precision"
 CONTEXT_RECALL_KEY = "context_recall"
-# Both context metrics are skipped for healthy cases (no retrieved chunks)
 CONTEXT_METRICS_SKIP = {CONTEXT_PRECISION_KEY, CONTEXT_RECALL_KEY}
 
-
-# --------------------------------------------------------------------------- #
-# Judge LLM call — identical to 05_geval.py
-# --------------------------------------------------------------------------- #
 
 PROMPT_TEMPLATE = """Kamu adalah dokter gigi ahli yang mengevaluasi laporan klinis yang dihasilkan oleh sistem AI. Evaluasi SATU kriteria pada satu waktu menggunakan langkah-langkah chain-of-thought yang diberikan.
 
@@ -317,6 +250,22 @@ Ikuti langkah evaluasi di atas secara internal, lalu output HANYA objek JSON den
 def build_prompt(criterion: Criterion, report_text: str, contexts_text: str,
                  query: str, tooth: str, lokasi: str, severity: str,
                  no_context: bool = False) -> str:
+    """
+    Construct evaluation prompt with or without RAG context chunks.
+
+    Args:
+        criterion: Target RAGAS evaluation criterion.
+        report_text: Clinician report text under test.
+        contexts_text: Formatted literature context passages.
+        query: Clinical detection query string.
+        tooth: FDI tooth number.
+        lokasi: Lesion surface.
+        severity: Severity category string.
+        no_context: Flag indicating whether context chunks are absent.
+
+    Returns:
+        Formatted prompt ready for model evaluation.
+    """
     steps = "\n".join(f"{i+1}. {s}" for i, s in enumerate(criterion.evaluation_steps))
     template = PROMPT_TEMPLATE_NO_CONTEXT if no_context else PROMPT_TEMPLATE
     fmt = dict(
@@ -336,8 +285,18 @@ def build_prompt(criterion: Criterion, report_text: str, contexts_text: str,
 
 def call_ollama(prompt: str, model: str, base_url: str,
                 max_retries: int = 5, timeout: int = 300) -> dict:
-    """Call Ollama via /api/generate. Returns parsed JSON dict.
-    Mirrors 05_geval.py exactly — strips <think> tags, retries on 5xx/timeout.
+    """
+    Call Ollama judge model with exponential retry backoff and robust JSON extraction.
+
+    Args:
+        prompt: Evaluation prompt string.
+        model: Ollama model name.
+        base_url: Server HTTP endpoint.
+        max_retries: Number of retry attempts.
+        timeout: Request timeout seconds.
+
+    Returns:
+        Parsed evaluation dictionary containing 'score' and 'reasoning'.
     """
     url = f"{base_url}/api/generate"
     full_prompt = (
@@ -361,7 +320,7 @@ def call_ollama(prompt: str, model: str, base_url: str,
     for attempt in range(1, max_retries + 1):
         if attempt > 1:
             payload["options"]["temperature"] = min(0.2 * (attempt - 1), 1.0)
-            
+
         try:
             resp = requests.post(url, json=payload, timeout=timeout)
             if resp.status_code >= 500:
@@ -374,11 +333,9 @@ def call_ollama(prompt: str, model: str, base_url: str,
             resp.raise_for_status()
             data = resp.json()
             raw_text = data["response"]
-            # Strip Qwen3 <think>…</think> blocks
+            # Strip reasoning tags
             text = re.sub(r"<think>.*?</think>", "", raw_text, flags=re.DOTALL).strip()
-            # Strip markdown fences
             text = re.sub(r"^\s*$", "", text).strip()
-            # Extract first JSON object
             match = re.search(r"\{.*\}", text, flags=re.DOTALL)
             if match:
                 return json.loads(match.group())
@@ -400,7 +357,16 @@ def call_ollama(prompt: str, model: str, base_url: str,
 
 
 def extract_score(parsed: dict, criterion_name: str) -> tuple[Optional[int], str]:
-    """Extract score + reasoning with fuzzy key matching. Mirrors 05_geval.py."""
+    """
+    Extract integer score and reasoning from JSON dictionary using fuzzy key heuristics.
+
+    Args:
+        parsed: Response dictionary from Ollama judge.
+        criterion_name: Name of evaluated metric.
+
+    Returns:
+        Tuple of (score_int, reasoning_str).
+    """
     score = None
     for key in ("score", "skor", "nilai", "Score", "SCORE"):
         if key in parsed:
@@ -442,16 +408,30 @@ def extract_score(parsed: dict, criterion_name: str) -> tuple[Optional[int], str
     return score, reasoning
 
 
-# --------------------------------------------------------------------------- #
-# Report loading / text assembly
-# --------------------------------------------------------------------------- #
-
 def load_report(path: str) -> dict:
+    """
+    Load and parse a clinical report JSON file from disk.
+
+    Args:
+        path: Path to target JSON file.
+
+    Returns:
+        Parsed JSON dictionary.
+    """
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
 
 def assemble_report_text(report: dict) -> str:
+    """
+    Format clinician report sections into a unified text block for evaluation.
+
+    Args:
+        report: Parsed report sidecar dictionary.
+
+    Returns:
+        String containing Temuan, Interpretasi, and Rekomendasi sections.
+    """
     d = report["report"]["laporan_dokter"]
     return (
         f"Temuan: {d.get('temuan', '')}\n"
@@ -461,6 +441,15 @@ def assemble_report_text(report: dict) -> str:
 
 
 def assemble_contexts_text(report: dict) -> str:
+    """
+    Format retrieved knowledge base context passages into labeled text blocks.
+
+    Args:
+        report: Parsed report sidecar dictionary containing 'contexts' list.
+
+    Returns:
+        Concatenated chunk text blocks or empty string if none present.
+    """
     contexts = report.get("contexts", [])
     if not contexts:
         return ""
@@ -468,11 +457,17 @@ def assemble_contexts_text(report: dict) -> str:
     return "\n\n".join(f"[Chunk {i+1}]\n{c}" for i, c in enumerate(chunks))
 
 
-# --------------------------------------------------------------------------- #
-# Main evaluation loop
-# --------------------------------------------------------------------------- #
-
 def evaluate_report(report: dict, report_id: str) -> dict:
+    """
+    Evaluate a single clinical report across all configured RAGAS metrics.
+
+    Args:
+        report: Parsed report dictionary.
+        report_id: Unique report identifier.
+
+    Returns:
+        Dictionary mapping metric names to their score and reasoning payloads.
+    """
     query       = report.get("query", "")
     manual      = report.get("manual_input", {})
     tooth       = manual.get("no_gigi", "")
@@ -486,11 +481,11 @@ def evaluate_report(report: dict, report_id: str) -> dict:
     result = {"report_id": report_id}
 
     for crit in RAGAS_CRITERIA:
-        # Skip context metrics when there are no retrieved chunks (healthy cases)
+        # Context-dependent metrics are skipped for healthy cases
         if crit.name in CONTEXT_METRICS_SKIP and not has_contexts:
             result[crit.name] = {
                 "score":     None,
-                "reasoning": "N/A — kasus healthy, tidak ada konteks yang diambil (by design)."
+                "reasoning": "N/A — healthy case, no context chunks retrieved (by design)."
             }
             print(f"  {crit.name}: N/A (no contexts)")
             continue
@@ -510,13 +505,31 @@ def evaluate_report(report: dict, report_id: str) -> dict:
 
 
 def write_sidecar(result: dict, report_id: str) -> str:
-    out_path = os.path.join(OUTPUT_DIR, f"{report_id}_ragas.json")
+    """
+    Save evaluation score payload to an individual JSON sidecar file.
+
+    Args:
+        result: Evaluation results dictionary.
+        report_id: Report identifier.
+
+    Returns:
+        Filesystem path to the written sidecar file.
+    """
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    out_path = str(OUTPUT_DIR / f"{report_id}_ragas.json")
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(result, f, ensure_ascii=False, indent=2)
     return out_path
 
 
 def append_to_csv_rows(result: dict, rows: list[dict]) -> None:
+    """
+    Flatten evaluation results into row items for spreadsheet export.
+
+    Args:
+        result: Evaluation dictionary.
+        rows: Destination list for CSV row records.
+    """
     for metric in METRIC_KEYS:
         payload = result.get(metric, {})
         if isinstance(payload, dict):
@@ -534,7 +547,17 @@ def append_to_csv_rows(result: dict, rows: list[dict]) -> None:
 
 
 def write_aggregate_csv(rows: list[dict]) -> str:
-    out_path = os.path.join(OUTPUT_DIR, "ragas_scores.csv")
+    """
+    Export collected evaluation records to an aggregate CSV file.
+
+    Args:
+        rows: List of metric score dictionaries.
+
+    Returns:
+        Filesystem path to the generated CSV file.
+    """
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    out_path = str(OUTPUT_DIR / "ragas_scores.csv")
     fieldnames = ["report_id", "metric", "score", "reasoning"]
     with open(out_path, "w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -543,12 +566,10 @@ def write_aggregate_csv(rows: list[dict]) -> str:
     return out_path
 
 
-# --------------------------------------------------------------------------- #
-# Main
-# --------------------------------------------------------------------------- #
-
 def main():
-    # Connectivity check — mirrors 05_geval.py
+    """
+    Batch evaluate clinical reports using RAGAS criteria with a local judge LLM.
+    """
     try:
         r = requests.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=5)
         r.raise_for_status()
@@ -558,29 +579,27 @@ def main():
                   f"Available: {models}. Will attempt to pull on first call.",
                   file=sys.stderr)
         else:
-            print(f"Using Ollama model: {JUDGE_MODEL}")
+            print(f"Using Ollama judge model: {JUDGE_MODEL}")
     except requests.RequestException as e:
         print(f"ERROR: cannot reach Ollama at {OLLAMA_BASE_URL}: {e}", file=sys.stderr)
-        print("Make sure 'ollama serve' is running.", file=sys.stderr)
+        print("Ensure 'ollama serve' is running.", file=sys.stderr)
         sys.exit(1)
 
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    paths = sorted(glob.glob(os.path.join(INPUT_DIR, REPORT_PATTERN)))
+    paths = sorted(glob.glob(str(INPUT_DIR / REPORT_PATTERN)))
     if not paths:
         print(f"No files matched '{REPORT_PATTERN}' in {INPUT_DIR}", file=sys.stderr)
         sys.exit(1)
 
     print(f"Found {len(paths)} report(s) in {INPUT_DIR}")
-    print("NOTE: Delete existing _ragas.json sidecars before running if you want "
-          "to re-score with the updated prompts (SKIP_EXISTING=True skips them).")
     all_rows: list[dict] = []
 
     for path in paths:
         report_id    = os.path.splitext(os.path.basename(path))[0]
-        sidecar_path = os.path.join(OUTPUT_DIR, f"{report_id}_ragas.json")
+        sidecar_path = OUTPUT_DIR / f"{report_id}_ragas.json"
 
-        if SKIP_EXISTING and os.path.exists(sidecar_path):
+        if SKIP_EXISTING and sidecar_path.exists():
             print(f"[skip] {report_id} (sidecar exists)")
             with open(sidecar_path, "r", encoding="utf-8") as f:
                 result = json.load(f)

@@ -65,7 +65,7 @@ A custom-trained YOLOv8 model is used for secondary caries detection and segment
 The model is trained on a curated infrared dental dataset.
 
 ### **Training Configuration**
-- **Base model:** `yolov8l.pt`  
+- **Base model:** `yolov8s.pt`  
 - **Image size:** 640×640  
 - **Epochs:** 500  
 - **Optimizer:** AdamW  

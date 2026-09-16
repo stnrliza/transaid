@@ -1,35 +1,33 @@
 """
-Build knowledge base dari jurnal PDF ke ChromaDB.
-Jalankan sekali saja — hasilnya tersimpan permanen.
+Knowledge Base Construction Module for CDSS (TransAID).
 
-Improvements dari versi sebelumnya:
-- Sentence-aware chunking (nltk) — tidak memotong di tengah kalimat
-- Chunk size lebih kecil (150 kata) — embedding lebih focused
-- Biomedical embedding model (pubmedbert) — lebih relevan untuk teks dental/klinis
-- Metadata per chunk (source filename, chunk index) — untuk debugging & filtering
-- Wipe and recreate collection untuk clean rebuild
+Extracts text from dental literature PDF files, strips references and bibliography
+sections, performs sentence-aware chunking with NLTK, embeds chunks using a biomedical
+transformer model (PubMedBERT), and persists vectors and metadata into ChromaDB.
 """
 
 import os
 import re
+from pathlib import Path
 import nltk
 from pypdf import PdfReader
 import chromadb
 from sentence_transformers import SentenceTransformer
 
-# Download nltk sentence tokenizer data jika belum ada
+# Download NLTK sentence tokenizer data if not already present
 nltk.download("punkt", quiet=True)
 nltk.download("punkt_tab", quiet=True)
 
 # ── CONFIG ──────────────────────────────────────────
-JOURNALS_FOLDER        = "./knowledge_base/"
-CHROMA_PATH            = "./chroma_db/"
-COLLECTION_NAME        = "karies_knowledge"
-CHUNK_TARGET_WORDS     = 150   # target kata per chunk
-CHUNK_OVERLAP_WORDS    = 30    # overlap antar chunk (dalam kata)
-BATCH_SIZE             = 100
-BIBLIOGRAPHY_THRESHOLD = 0.3
-EMBEDDING_MODEL        = "NeuML/pubmedbert-base-embeddings"
+BASE_DIR               = Path(__file__).resolve().parent
+JOURNALS_FOLDER        = Path(os.getenv("JOURNALS_FOLDER", str(BASE_DIR / "knowledge_base")))
+CHROMA_PATH            = Path(os.getenv("CHROMA_PATH", str(BASE_DIR / "chroma_db")))
+COLLECTION_NAME        = os.getenv("COLLECTION_NAME", "karies_knowledge")
+CHUNK_TARGET_WORDS     = int(os.getenv("CHUNK_TARGET_WORDS", "150"))   # Target word count per chunk
+CHUNK_OVERLAP_WORDS    = int(os.getenv("CHUNK_OVERLAP_WORDS", "30"))    # Word overlap between chunks
+BATCH_SIZE             = int(os.getenv("BATCH_SIZE", "100"))
+BIBLIOGRAPHY_THRESHOLD = float(os.getenv("BIBLIOGRAPHY_THRESHOLD", "0.3"))
+EMBEDDING_MODEL        = os.getenv("EMBEDDING_MODEL", "NeuML/pubmedbert-base-embeddings")
 # ────────────────────────────────────────────────────
 
 
@@ -41,6 +39,15 @@ REFERENCES_HEADING_RE = re.compile(
 
 
 def _looks_like_citation(line: str) -> bool:
+    """
+    Check whether a text line matches academic citation patterns.
+
+    Args:
+        line: Text string to evaluate.
+
+    Returns:
+        True if the line matches citation formatting heuristics, False otherwise.
+    """
     if re.match(r"^\s*[\[\(]?\d+[\]\)]?\.?\s+[A-Z]", line):
         if re.search(r"\d{4}", line):
             return True
@@ -52,6 +59,15 @@ def _looks_like_citation(line: str) -> bool:
 
 
 def strip_references_section(text: str) -> str:
+    """
+    Locate bibliography or references headings and strip reference sections from extracted text.
+
+    Args:
+        text: Raw document text extracted from PDF.
+
+    Returns:
+        Sanitized document text with references removed.
+    """
     matches = list(REFERENCES_HEADING_RE.finditer(text))
     if not matches:
         return text
@@ -82,6 +98,16 @@ def strip_references_section(text: str) -> str:
 
 
 def is_bibliography_chunk(chunk: str, threshold: float = BIBLIOGRAPHY_THRESHOLD) -> bool:
+    """
+    Determine whether a text chunk consists predominantly of bibliographic citations.
+
+    Args:
+        chunk: Text chunk to evaluate.
+        threshold: Ratio of citation-like segments required to classify as bibliography.
+
+    Returns:
+        True if citation density exceeds threshold, False otherwise.
+    """
     segments = re.split(r"(?<=\.)\s+(?=[A-Z])", chunk)
     if len(segments) < 3:
         return False
@@ -91,6 +117,15 @@ def is_bibliography_chunk(chunk: str, threshold: float = BIBLIOGRAPHY_THRESHOLD)
 
 
 def extract_text(pdf_path: str) -> tuple[str, int]:
+    """
+    Extract text content from a PDF file and strip bibliography sections.
+
+    Args:
+        pdf_path: Filesystem path to the target PDF file.
+
+    Returns:
+        A tuple of (sanitized_text, stripped_character_count).
+    """
     reader = PdfReader(pdf_path)
     text = ""
     for page in reader.pages:
@@ -104,11 +139,17 @@ def extract_text(pdf_path: str) -> tuple[str, int]:
 
 def chunk_text(text: str) -> tuple[list[str], int, int]:
     """
-    Sentence-aware chunking:
-    - Tokenize ke kalimat dulu pakai nltk
-    - Gabungkan kalimat sampai mencapai CHUNK_TARGET_WORDS
-    - Overlap: ambil kembali kalimat-kalimat terakhir dari chunk sebelumnya
-      yang totalnya <= CHUNK_OVERLAP_WORDS
+    Segment text into sliding-window chunks with sentence boundary awareness.
+
+    Tokenizes text into sentences using NLTK to prevent splitting mid-sentence,
+    groups sentences up to CHUNK_TARGET_WORDS, and retains trailing sentences
+    for context overlap across chunks.
+
+    Args:
+        text: Preprocessed document text.
+
+    Returns:
+        A tuple of (chunks_list, dropped_short_count, dropped_bibliography_count).
     """
     sentences = nltk.sent_tokenize(text)
     chunks = []
@@ -116,13 +157,13 @@ def chunk_text(text: str) -> tuple[list[str], int, int]:
     dropped_biblio = 0
 
     i = 0
-    overlap_sentences = []  # kalimat overlap dari chunk sebelumnya
+    overlap_sentences = []  # Overlapping sentences retained from previous chunk
 
     while i < len(sentences):
-        current_sentences = list(overlap_sentences)  # mulai dengan overlap
+        current_sentences = list(overlap_sentences)  # Seed with overlap
         current_word_count = sum(len(s.split()) for s in current_sentences)
 
-        # Tambahkan kalimat sampai mencapai target
+        # Append sentences until target word limit is reached
         while i < len(sentences):
             sentence = sentences[i]
             sentence_words = len(sentence.split())
@@ -138,14 +179,13 @@ def chunk_text(text: str) -> tuple[list[str], int, int]:
 
         chunk = " ".join(current_sentences)
 
-        # Filter chunk terlalu pendek
+        # Filter out chunks that are too short (<= 30 words)
         if len(chunk.split()) <= 30:
             dropped_short += 1
-            # Reset overlap
             overlap_sentences = []
             continue
 
-        # Filter bibliography
+        # Filter out residual bibliography chunks
         if is_bibliography_chunk(chunk):
             dropped_biblio += 1
             overlap_sentences = []
@@ -153,7 +193,7 @@ def chunk_text(text: str) -> tuple[list[str], int, int]:
 
         chunks.append(chunk)
 
-        # Hitung overlap: ambil kalimat-kalimat terakhir <= CHUNK_OVERLAP_WORDS
+        # Calculate overlap: collect trailing sentences totaling <= CHUNK_OVERLAP_WORDS
         overlap_sentences = []
         overlap_word_count = 0
         for s in reversed(current_sentences):
@@ -167,6 +207,16 @@ def chunk_text(text: str) -> tuple[list[str], int, int]:
 
 
 def deduplicate_chunks(chunks: list[str], metadatas: list[dict]) -> tuple[list[str], list[dict]]:
+    """
+    Remove identical or whitespace-normalized duplicate chunks while preserving metadata.
+
+    Args:
+        chunks: List of extracted text chunks.
+        metadatas: Corresponding metadata dictionary for each chunk.
+
+    Returns:
+        A tuple of (unique_chunks, unique_metadatas).
+    """
     seen = set()
     unique_chunks = []
     unique_metadatas = []
@@ -180,7 +230,14 @@ def deduplicate_chunks(chunks: list[str], metadatas: list[dict]) -> tuple[list[s
 
 
 def main():
-    # 1. Baca semua PDF
+    """
+    Process dental literature PDFs, generate embeddings, and build ChromaDB collection.
+    """
+    if not JOURNALS_FOLDER.exists():
+        print(f"Error: Knowledge base directory not found at {JOURNALS_FOLDER}")
+        return
+
+    # 1. Read all PDF files
     all_chunks = []
     all_metadatas = []
 
@@ -204,29 +261,30 @@ def main():
             f"{chars_stripped} chars stripped by heading filter)"
         )
 
-    print(f"\nTotal chunks before dedup: {len(all_chunks)}")
+    print(f"\nTotal chunks before deduplication: {len(all_chunks)}")
     all_chunks, all_metadatas = deduplicate_chunks(all_chunks, all_metadatas)
-    print(f"Total chunks after dedup:  {len(all_chunks)}")
+    print(f"Total chunks after deduplication:  {len(all_chunks)}")
 
     # 2. Load embedding model
     print(f"\nLoading embedding model: {EMBEDDING_MODEL} ...")
     embedder = SentenceTransformer(EMBEDDING_MODEL)
 
-    # 3. Setup ChromaDB — wipe and recreate
-    print("Setting up ChromaDB (wipe and recreate)...")
-    client = chromadb.PersistentClient(path=CHROMA_PATH)
+    # 3. Setup ChromaDB — clean wipe and recreation
+    print(f"Setting up ChromaDB at {CHROMA_PATH} (wipe and recreate)...")
+    CHROMA_PATH.mkdir(parents=True, exist_ok=True)
+    client = chromadb.PersistentClient(path=str(CHROMA_PATH))
     try:
         client.delete_collection(COLLECTION_NAME)
         print(f"  Existing collection '{COLLECTION_NAME}' deleted.")
     except Exception:
-        print(f"  No existing collection to delete.")
+        print("  No existing collection to delete.")
     collection = client.create_collection(
         COLLECTION_NAME,
         metadata={"hnsw:space": "cosine"}
     )
 
-    # 4. Embed dan simpan per batch
-    print("Embedding dan menyimpan ke ChromaDB...")
+    # 4. Embed and persist batches
+    print("Generating embeddings and writing to ChromaDB...")
     for i in range(0, len(all_chunks), BATCH_SIZE):
         batch_docs = all_chunks[i:i + BATCH_SIZE]
         batch_meta = all_metadatas[i:i + BATCH_SIZE]
@@ -239,8 +297,8 @@ def main():
         )
         print(f"  Progress: {min(i + BATCH_SIZE, len(all_chunks))}/{len(all_chunks)}")
 
-    print("\nKnowledge base selesai ✅")
-    print(f"Total tersimpan: {collection.count()} chunks")
+    print("\nKnowledge base construction complete ✅")
+    print(f"Total chunks stored: {collection.count()}")
 
 
 if __name__ == "__main__":
