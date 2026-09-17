@@ -1,17 +1,17 @@
 """
-End-to-End Clinical Decision Support System (CDSS) Reporting Pipeline.
+Clinical Decision Support System (CDSS) Report Generation Library.
 
-This module orchestrates the complete diagnostic and reporting workflow:
-1. YOLOv8 Instance Segmentation: Detects secondary caries in Near-Infrared Light
-   Transillumination (NILT) dental images.
-2. Clinical Query Construction: Translates visual detections and practitioner input
-   (FDI tooth number, surface location) into structured clinical queries.
-3. Cross-Lingual RAG Retrieval: Translates queries to English and retrieves relevant
+This module provides the core clinical synthesis, RAG retrieval, and PDF typesetting
+services for TransAID:
+1. Clinical Query Construction: Synthesizes visual detections and practitioner metadata
+   into structured clinical queries.
+2. Cross-Lingual RAG Retrieval: Translates queries to English and retrieves relevant
    evidence-based dental literature from ChromaDB.
-4. LLM Report Synthesis: Uses a clinical LLM (e.g., Gemma, Qwen) to synthesize dual-audience
+3. LLM Report Synthesis: Uses a clinical LLM (e.g., Gemma, Qwen) to synthesize dual-audience
    reports in Indonesian (clinician-facing and patient-facing).
-5. PDF Document Generation: Typesets a multi-page clinical report with side-by-side
+4. PDF Document Typesetting: Typesets professional multi-page clinical reports with side-by-side
    image overlays, diagnostic interpretations, and tailored oral hygiene guidance.
+5. Structured Data Persistence: Exports full case metadata to JSON sidecars for offline evaluation.
 """
 
 import json
@@ -20,19 +20,23 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-import chromadb
-from fpdf import FPDF
-from openai import OpenAI
+from dotenv import load_dotenv
 from PIL import Image
-from sentence_transformers import SentenceTransformer
-from ultralytics import YOLO
+
+load_dotenv()
 
 # ── CONFIGURATION & ENVIRONMENT ─────────────────────
 BASE_DIR        = Path(__file__).resolve().parent
-YOLO_MODEL_PATH = os.getenv("YOLO_MODEL_PATH", str(BASE_DIR.parent / "yolo" / "weights" / "best.pt"))
+REPO_ROOT       = BASE_DIR.parent.parent
 CHROMA_PATH     = Path(os.getenv("CHROMA_PATH", str(BASE_DIR / "chroma_db")))
 COLLECTION_NAME = os.getenv("COLLECTION_NAME", "karies_knowledge")
-OUTPUT_FOLDER   = Path(os.getenv("CDSS_OUTPUT_DIR", str(BASE_DIR / "outputs" / "reports")))
+
+_output_dir_env = os.getenv("OUTPUT_DIR", os.getenv("CDSS_OUTPUT_DIR", "src/outputs"))
+OUTPUT_DIR      = Path(_output_dir_env)
+if not OUTPUT_DIR.is_absolute():
+    OUTPUT_DIR = REPO_ROOT / OUTPUT_DIR
+OUTPUT_FOLDER   = OUTPUT_DIR  # Backwards-compatibility alias
+
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
 LLM_MODEL       = os.getenv("LLM_MODEL", "gemma3:12b")
 LLM_API_KEY     = os.getenv("LLM_API_KEY", "ollama")
@@ -40,35 +44,13 @@ TOP_K_CHUNKS    = int(os.getenv("TOP_K_CHUNKS", "5"))
 # ────────────────────────────────────────────────────
 
 # Module-level component caches for lazy instantiation
-_yolo_model: Optional[YOLO] = None
-_embedder: Optional[SentenceTransformer] = None
-_chroma_client: Optional[chromadb.PersistentClient] = None
+_embedder = None
+_chroma_client = None
 _chroma_collection = None
-_llm_client: Optional[OpenAI] = None
+_llm_client = None
 
 
-def get_yolo_model(model_path: str = YOLO_MODEL_PATH) -> YOLO:
-    """
-    Retrieve or lazily initialize the YOLOv8 segmentation model.
-
-    Args:
-        model_path: Path to the trained YOLO weights file (.pt).
-
-    Returns:
-        Loaded Ultralytics YOLO model instance.
-    """
-    global _yolo_model
-    if _yolo_model is None:
-        if not Path(model_path).exists():
-            raise FileNotFoundError(
-                f"YOLO model weights not found at: {model_path}. "
-                "Please configure YOLO_MODEL_PATH in your environment or .env file."
-            )
-        _yolo_model = YOLO(model_path)
-    return _yolo_model
-
-
-def get_embedder() -> SentenceTransformer:
+def get_embedder():
     """
     Retrieve or lazily initialize the biomedical text embedding model.
 
@@ -77,6 +59,13 @@ def get_embedder() -> SentenceTransformer:
     """
     global _embedder
     if _embedder is None:
+        try:
+            from sentence_transformers import SentenceTransformer
+        except ImportError as e:
+            raise ImportError(
+                "The 'sentence-transformers' package is required for RAG embeddings. "
+                "Please install it via 'pip install sentence-transformers'."
+            ) from e
         _embedder = SentenceTransformer("NeuML/pubmedbert-base-embeddings")
     return _embedder
 
@@ -96,13 +85,20 @@ def get_chroma_collection(chroma_path: Path = CHROMA_PATH,
     global _chroma_client, _chroma_collection
     if _chroma_collection is None:
         if _chroma_client is None:
+            try:
+                import chromadb
+            except ImportError as e:
+                raise ImportError(
+                    "The 'chromadb' package is required for vector search. "
+                    "Please install it via 'pip install chromadb'."
+                ) from e
             _chroma_client = chromadb.PersistentClient(path=str(chroma_path))
         _chroma_collection = _chroma_client.get_collection(collection_name)
     return _chroma_collection
 
 
 def get_llm_client(base_url: str = OLLAMA_BASE_URL,
-                   api_key: str = LLM_API_KEY) -> OpenAI:
+                   api_key: str = LLM_API_KEY):
     """
     Retrieve or lazily initialize the OpenAI-compatible LLM client (Ollama/OpenAI).
 
@@ -115,25 +111,15 @@ def get_llm_client(base_url: str = OLLAMA_BASE_URL,
     """
     global _llm_client
     if _llm_client is None:
+        try:
+            from openai import OpenAI
+        except ImportError as e:
+            raise ImportError(
+                "The 'openai' package is required for LLM client communication. "
+                "Please install it via 'pip install openai'."
+            ) from e
         _llm_client = OpenAI(base_url=base_url, api_key=api_key)
     return _llm_client
-
-
-def severity_label(confidence: float) -> str:
-    """
-    Classify clinical severity based on YOLO detection confidence.
-
-    Args:
-        confidence: Detection confidence score between 0.0 and 1.0.
-
-    Returns:
-        Indonesian/English severity string: 'Tinggi (High)', 'Sedang (Moderate)', or 'Rendah (Low)'.
-    """
-    if confidence >= 0.75:
-        return "Tinggi (High)"
-    elif confidence >= 0.5:
-        return "Sedang (Moderate)"
-    return "Rendah (Low)"
 
 
 # FDI tooth notation to Indonesian colloquial name mapping
@@ -191,69 +177,7 @@ def get_tooth_name(no_gigi: str) -> str:
     return FDI_TOOTH_NAME.get(str(no_gigi).strip(), f"gigi {no_gigi}")
 
 
-# ── COMPONENT 1: YOLOv8 INFERENCE ───────────────────
-def run_yolo(image_path: str, output_folder: Path = OUTPUT_FOLDER) -> dict:
-    """
-    Run YOLOv8 segmentation inference and save side-by-side visualization images.
-
-    Args:
-        image_path: Filesystem path to the input NILT dental image.
-        output_folder: Destination folder for output overlay images.
-
-    Returns:
-        Dictionary containing class_name, confidence, severity, vis_path, and orig_path.
-    """
-    model = get_yolo_model()
-    output_folder.mkdir(parents=True, exist_ok=True)
-
-    results = model(image_path)
-    result  = results[0]
-
-    # Save copy of original image for side-by-side comparison
-    orig_path = str(output_folder / "yolo_original.jpg")
-    Image.open(image_path).convert("RGB").save(orig_path)
-
-    # Save segmentation mask overlay
-    vis_path = str(output_folder / "yolo_result.jpg")
-    result.save(filename=vis_path)
-
-    # Extract primary detection (assuming one lesion per cropped tooth image)
-    if len(result.boxes) == 0:
-        return {
-            "class_name": None,
-            "confidence": None,
-            "severity":   None,
-            "vis_path":   vis_path,
-            "orig_path":  orig_path,
-        }
-
-    box        = result.boxes[0]
-    class_id   = int(box.cls[0])
-    confidence = float(box.conf[0])
-    class_name = model.names[class_id]
-
-    return {
-        "class_name":  class_name,
-        "confidence":  confidence,
-        "vis_path":    vis_path,
-        "orig_path":   orig_path,
-        "severity":    severity_label(confidence),
-    }
-
-
-# ── COMPONENT 2: QUERY BUILDER ──────────────────────
-def get_manual_input() -> dict:
-    """
-    Prompt dentist for manual clinical metadata via interactive terminal.
-
-    Returns:
-        Dictionary with keys 'no_gigi' (FDI notation) and 'lokasi' (lesion surface).
-    """
-    no_gigi = input("Tooth number (FDI notation, 11-48): ").strip()
-    lokasi  = input("Lesion location / surface (mesial/distal/oklusal/servikal/bukal/lingual): ").strip().lower()
-    return {"no_gigi": no_gigi, "lokasi": lokasi}
-
-
+# ── COMPONENT: QUERY BUILDER ────────────────────────
 def build_query(detection: dict, manual: dict) -> str:
     """
     Synthesize YOLO detection output and manual clinical metadata into a clinical query.
@@ -351,7 +275,7 @@ def translate_query_to_english(query: str) -> str:
         return query
 
 
-# ── COMPONENT 3: RAG RETRIEVAL ──────────────────────
+# ── COMPONENT: RAG RETRIEVAL ────────────────────────
 def retrieve_context(query: str, top_k: int = TOP_K_CHUNKS) -> list[str]:
     """
     Retrieve Top-K most relevant document chunks from ChromaDB knowledge base.
@@ -374,7 +298,7 @@ def retrieve_context(query: str, top_k: int = TOP_K_CHUNKS) -> list[str]:
     return results["documents"][0]
 
 
-# ── COMPONENT 4: LLM REPORT GENERATION ──────────────
+# ── COMPONENT: LLM REPORT GENERATION ────────────────
 SYSTEM_PROMPT = """Kamu adalah sistem CDSS untuk dokter gigi.
 Gunakan referensi klinis yang diberikan untuk membuat laporan akurat.
 
@@ -633,7 +557,7 @@ def generate_healthy_report_static(no_gigi: str, lokasi: str) -> dict:
     }
 
 
-# ── COMPONENT 5: PDF GENERATOR ──────────────────────
+# ── COMPONENT: PDF GENERATOR ────────────────────────
 # Color palette matching clinical sample specifications
 NAVY        = (21, 67, 96)      # Primary header / dark column labels
 NAVY_LIGHT  = (52, 110, 145)    # Secondary column labels
@@ -644,7 +568,7 @@ TEXT_DARK   = (40, 40, 40)
 GRAY_TEXT   = (110, 110, 110)
 
 
-def _section_row(pdf: FPDF, label: str, text: str, fill_color: tuple) -> None:
+def _section_row(pdf, label: str, text: str, fill_color: tuple) -> None:
     """
     Render a two-column section row with a colored label badge on the left and body text on the right.
 
@@ -690,13 +614,13 @@ def _section_row(pdf: FPDF, label: str, text: str, fill_color: tuple) -> None:
 
 def generate_pdf(detection: dict, report: dict, query: str,
                  patient_name: str = "-", tooth: str = "-", lokasi: str = "-",
-                 report_no: str = None, is_healthy: bool = False,
-                 output_folder: Path = OUTPUT_FOLDER) -> str:
+                 report_no: Optional[str] = None, is_healthy: bool = False,
+                 output_dir: Optional[Path] = None, uid: Optional[str] = None) -> str:
     """
     Typeset and generate a formatted multi-page clinical PDF report.
 
     Args:
-        detection: YOLOv8 detection metadata dictionary.
+        detection: YOLO detection metadata dictionary (must contain vis_path and orig_path if available).
         report: Dual-audience report dictionary ('laporan_dokter' & 'laporan_pasien').
         query: Formulated clinical query string.
         patient_name: Patient identifier.
@@ -704,19 +628,35 @@ def generate_pdf(detection: dict, report: dict, query: str,
         lokasi: Lesion surface.
         report_no: Unique clinical report identifier.
         is_healthy: Boolean flag indicating healthy tooth finding.
-        output_folder: Destination filesystem directory.
+        output_dir: Destination filesystem directory. Defaults to OUTPUT_DIR.
+        uid: Unique session identifier string. If provided, writes <uid>.pdf.
 
     Returns:
         Filesystem path to the generated PDF document.
     """
-    output_folder.mkdir(parents=True, exist_ok=True)
+    try:
+        from fpdf import FPDF
+    except ImportError as e:
+        raise ImportError(
+            "The 'fpdf2' package is required for clinical PDF generation. "
+            "Please install it via 'pip install fpdf2'."
+        ) from e
+
+    dest_dir = Path(output_dir) if output_dir is not None else OUTPUT_DIR
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    if is_healthy:
-        pdf_path = str(output_folder / f"laporan_healthy_gigi{tooth}_{lokasi}_{timestamp}.pdf")
+    if uid:
+        pdf_path = str(dest_dir / f"{uid}.pdf")
+        if report_no is None:
+            report_no = f"NILT-{datetime.now().strftime('%Y%m%d')}-{uid}"
     else:
-        pdf_path = str(output_folder / f"laporan_{timestamp}.pdf")
-    if report_no is None:
-        report_no = f"NILT-{datetime.now().strftime('%Y%m%d')}-{timestamp[-4:]}"
+        if is_healthy:
+            pdf_path = str(dest_dir / f"laporan_healthy_gigi{tooth}_{lokasi}_{timestamp}.pdf")
+        else:
+            pdf_path = str(dest_dir / f"laporan_{timestamp}.pdf")
+        if report_no is None:
+            report_no = f"NILT-{datetime.now().strftime('%Y%m%d')}-{timestamp[-4:]}"
 
     pdf = FPDF()
     pdf.set_auto_page_break(auto=True, margin=15)
@@ -771,17 +711,20 @@ def generate_pdf(detection: dict, report: dict, query: str,
         pdf.multi_cell(col_w - 6, 5.5,
                         f"Pasien: {patient_name}\n"
                         f"Gigi: {tooth}\n"
-                        f"Kelas Deteksi: {detection['class_name']}")
+                        f"Kelas Deteksi: {detection.get('class_name', '-')}")
         pdf.set_xy(pdf.l_margin + col_w + 3, y_start + 2)
+        conf_str = f"{detection['confidence']*100:.0f}%" if detection.get("confidence") is not None else "-"
         pdf.multi_cell(col_w - 6, 5.5,
-                        f"Confidence: {detection['confidence']*100:.0f}%\n"
+                        f"Confidence: {conf_str}\n"
                         f"Tingkat Keparahan: {detection.get('severity', '-')}\n"
                         f"Lokasi Lesi: {lokasi}")
     pdf.set_xy(pdf.l_margin, y_start + 24)
     pdf.ln(3)
 
     # ── Side-by-side Images: Original NILT vs. Segmentation ──
-    if detection.get("vis_path"):
+    vis_path = detection.get("vis_path")
+    orig_path = detection.get("orig_path")
+    if vis_path and Path(vis_path).exists():
         pdf.set_font("Helvetica", "B", 12)
         pdf.set_text_color(*NAVY)
         pdf.cell(0, 7, "HASIL DETEKSI YOLOv8 - INSTANCE SEGMENTATION", ln=True)
@@ -789,9 +732,9 @@ def generate_pdf(detection: dict, report: dict, query: str,
 
         img_w  = col_w - 6
         img_y  = pdf.get_y()
-        orig_path = detection.get("orig_path", detection["vis_path"])
+        sample_img_path = orig_path if (orig_path and Path(orig_path).exists()) else vis_path
 
-        with Image.open(orig_path) as _im:
+        with Image.open(sample_img_path) as _im:
             img_h = img_w * _im.height / _im.width
         MAX_IMG_H = 70  # Constrain image height to fit onto a single page
         if img_h > MAX_IMG_H:
@@ -810,15 +753,18 @@ def generate_pdf(detection: dict, report: dict, query: str,
         pdf.set_xy(pdf.l_margin + col_w, img_y)
         pdf.cell(col_w, 5, "Hasil Segmentasi YOLOv8", align="C")
 
-        pdf.image(orig_path, x=pdf.l_margin + img_offset, y=img_y + 6, w=img_w_actual)
-        pdf.image(detection["vis_path"], x=pdf.l_margin + col_w + img_offset, y=img_y + 6, w=img_w_actual)
+        if orig_path and Path(orig_path).exists():
+            pdf.image(orig_path, x=pdf.l_margin + img_offset, y=img_y + 6, w=img_w_actual)
+        else:
+            pdf.image(vis_path, x=pdf.l_margin + img_offset, y=img_y + 6, w=img_w_actual)
+        pdf.image(vis_path, x=pdf.l_margin + col_w + img_offset, y=img_y + 6, w=img_w_actual)
 
         pdf.set_y(img_y + 6 + img_h + 3)
         pdf.set_font("Helvetica", "I", 8.5)
         pdf.set_text_color(*GRAY_TEXT)
         pdf.cell(0, 6,
                  "Kiri: Citra asli NILT  |  Kanan: Hasil instance segmentation "
-                 "(mask area karies ditampilkan dalam overlay biru)",
+                 "(mask area karies ditampilkan dalam overlay)",
                  ln=True, align="C")
         pdf.ln(4)
 
@@ -828,10 +774,10 @@ def generate_pdf(detection: dict, report: dict, query: str,
     pdf.cell(0, 8, "LAPORAN KLINIS - UNTUK DOKTER GIGI", ln=True)
     pdf.ln(1)
 
-    dokter = report["laporan_dokter"]
-    _section_row(pdf, "TEMUAN", dokter["temuan"], NAVY)
-    _section_row(pdf, "INTERPRETASI", dokter["interpretasi"], NAVY_LIGHT)
-    _section_row(pdf, "REKOMENDASI", dokter["rekomendasi"], NAVY)
+    dokter = report.get("laporan_dokter", {})
+    _section_row(pdf, "TEMUAN", dokter.get("temuan", ""), NAVY)
+    _section_row(pdf, "INTERPRETASI", dokter.get("interpretasi", ""), NAVY_LIGHT)
+    _section_row(pdf, "REKOMENDASI", dokter.get("rekomendasi", ""), NAVY)
 
     pdf.ln(2)
     pdf.set_font("Helvetica", "I", 8)
@@ -883,14 +829,14 @@ def generate_pdf(detection: dict, report: dict, query: str,
                         f"Tingkat Keparahan: -")
     else:
         pdf.multi_cell(col_w - 6, 5.5,
-                        f"Jenis: {detection['class_name']}\n"
+                        f"Jenis: {detection.get('class_name', '-')}\n"
                         f"Lokasi: {lokasi}\n"
                         f"Tingkat Keparahan: {detection.get('severity', '-')}")
     pdf.set_xy(pdf.l_margin, y_start + 22)
     pdf.ln(3)
 
     # Side-by-side images on patient page
-    if detection.get("vis_path"):
+    if vis_path and Path(vis_path).exists():
         pdf.set_font("Helvetica", "B", 12)
         pdf.set_text_color(*NAVY)
         pdf.cell(0, 7, "HASIL PEMERIKSAAN", ln=True)
@@ -898,9 +844,9 @@ def generate_pdf(detection: dict, report: dict, query: str,
 
         img_w  = col_w - 6
         img_y  = pdf.get_y()
-        orig_path = detection.get("orig_path", detection["vis_path"])
+        sample_img_path = orig_path if (orig_path and Path(orig_path).exists()) else vis_path
 
-        with Image.open(orig_path) as _im:
+        with Image.open(sample_img_path) as _im:
             img_h = img_w * _im.height / _im.width
         MAX_IMG_H = 70
         if img_h > MAX_IMG_H:
@@ -919,15 +865,18 @@ def generate_pdf(detection: dict, report: dict, query: str,
         pdf.set_xy(pdf.l_margin + col_w, img_y)
         pdf.cell(col_w, 5, "Hasil Segmentasi YOLOv8", align="C")
 
-        pdf.image(orig_path, x=pdf.l_margin + img_offset, y=img_y + 6, w=img_w_actual)
-        pdf.image(detection["vis_path"], x=pdf.l_margin + col_w + img_offset, y=img_y + 6, w=img_w_actual)
+        if orig_path and Path(orig_path).exists():
+            pdf.image(orig_path, x=pdf.l_margin + img_offset, y=img_y + 6, w=img_w_actual)
+        else:
+            pdf.image(vis_path, x=pdf.l_margin + img_offset, y=img_y + 6, w=img_w_actual)
+        pdf.image(vis_path, x=pdf.l_margin + col_w + img_offset, y=img_y + 6, w=img_w_actual)
 
         pdf.set_y(img_y + 6 + img_h + 3)
         pdf.set_font("Helvetica", "I", 8.5)
         pdf.set_text_color(*GRAY_TEXT)
         pdf.cell(0, 6,
                  "Kiri: Citra asli NILT  |  Kanan: Hasil instance segmentation "
-                 "(mask area karies ditampilkan dalam overlay biru)",
+                 "(mask area karies ditampilkan dalam overlay)",
                  ln=True, align="C")
         pdf.ln(4)
 
@@ -937,14 +886,15 @@ def generate_pdf(detection: dict, report: dict, query: str,
     pdf.cell(0, 7, "LAPORAN UNTUK PASIEN", ln=True)
     pdf.ln(2)
 
-    pasien = report["laporan_pasien"]
+    pasien = report.get("laporan_pasien", {})
     for label, key in [("Apa yang ditemukan?", "ringkasan"),
                        ("Apa yang perlu dilakukan?", "saran")]:
         box_y = pdf.get_y()
         page_w = pdf.w - pdf.l_margin - pdf.r_margin
+        content_text = pasien.get(key, "")
         pdf.set_xy(pdf.l_margin + 3, box_y + 8)
         pdf.set_font("Helvetica", size=10.5)
-        text_h = pdf.multi_cell(page_w - 6, 5.5, pasien[key],
+        text_h = pdf.multi_cell(page_w - 6, 5.5, content_text,
                                 dry_run=True, output="HEIGHT")
         box_h = text_h + 10
 
@@ -959,7 +909,7 @@ def generate_pdf(detection: dict, report: dict, query: str,
         pdf.set_xy(pdf.l_margin + 3, box_y + 8)
         pdf.set_font("Helvetica", size=10.5)
         pdf.set_text_color(*TEXT_DARK)
-        pdf.multi_cell(page_w - 6, 5.5, pasien[key])
+        pdf.multi_cell(page_w - 6, 5.5, content_text)
 
         pdf.set_y(box_y + box_h + 5)
 
@@ -968,155 +918,58 @@ def generate_pdf(detection: dict, report: dict, query: str,
     return pdf_path
 
 
-# ── MAIN PIPELINE EXECUTION ──────────────────────────
-def run(image_path: str, output_folder: Path = OUTPUT_FOLDER) -> dict:
+def save_report_json(detection: dict, report: dict, query: str,
+                     contexts: list[str], pdf_path: str,
+                     patient_name: str = "-", tooth: str = "-", lokasi: str = "-",
+                     image_path: str = "", output_dir: Optional[Path] = None,
+                     uid: Optional[str] = None) -> str:
     """
-    Execute the full end-to-end CDSS pipeline on an input image.
+    Persist structured case metadata to a JSON sidecar file for offline evaluation.
 
     Args:
-        image_path: Filesystem path to the NILT input image.
-        output_folder: Destination folder for output artifacts (PDF, JSON, overlays).
+        detection: YOLO detection dictionary.
+        report: Generated dual-audience report dictionary.
+        query: Formulated clinical query string.
+        contexts: Retrieved RAG passages.
+        pdf_path: Filesystem path to the generated PDF.
+        patient_name: Patient identifier.
+        tooth: FDI tooth number.
+        lokasi: Lesion surface.
+        image_path: Input image path.
+        output_dir: Destination directory (healthy/ or caries/).
+        uid: Unique session identifier string.
 
     Returns:
-        Dictionary containing detection, manual metadata, query, contexts, report, and pdf_path.
+        Filesystem path to the saved JSON file.
     """
-    output_folder.mkdir(parents=True, exist_ok=True)
-    print(f"\n{'='*50}")
-    print(f"Input: {image_path}")
+    dest_dir = Path(output_dir) if output_dir is not None else OUTPUT_DIR
+    dest_dir.mkdir(parents=True, exist_ok=True)
 
-    print("[1/5] Running YOLOv8 segmentation inference...")
-    detection = run_yolo(image_path, output_folder=output_folder)
-
-    is_healthy = (detection.get("class_name") is None)
-
-    if is_healthy:
-        print("      No caries detected — healthy tooth case.")
+    if uid:
+        json_path = str(dest_dir / f"{uid}.json")
     else:
-        print(f"      Detected: {detection['class_name']} ({detection['confidence']*100:.1f}%)")
-
-    print("[2/5] Collecting clinician input (tooth number & lesion location)...")
-    manual = get_manual_input()
-
-    print("[3/5] Constructing clinical query and retrieving RAG context...")
-    query = build_query(detection, manual)
-
-    if is_healthy:
-        # Healthy cases use deterministic template; bypass RAG retrieval and LLM call
-        chunks = []
-        print("      Healthy case — using deterministic clinical template.")
-        print("[4/5] Generating reports (static template)...")
-        report = generate_healthy_report_static(manual["no_gigi"], manual["lokasi"])
-    else:
-        # Cross-lingual RAG: translate query to English for biomedical retrieval
-        print("      Translating query to English for PubMedBERT retrieval...")
-        english_query = translate_query_to_english(query)
-        print(f"      Indonesian Query: {query}")
-        print(f"      English Query:    {english_query}")
-
-        chunks = retrieve_context(english_query)
-        print(f"      {len(chunks)} relevant chunks retrieved from knowledge base")
-        print("[4/5] Generating clinical reports via LLM...")
-        report = generate_report(query, chunks)
-
-    print("      Reports generated successfully ✅")
-
-    print("[5/5] Generating PDF report...")
-    pdf_path = generate_pdf(detection, report, query,
-                            tooth=manual["no_gigi"], lokasi=manual["lokasi"],
-                            is_healthy=is_healthy, output_folder=output_folder)
-    print(f"      PDF saved: {pdf_path}")
-
-    # Persist structured execution metadata to JSON for offline evaluation
-    if is_healthy:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        json_path = str(
-            output_folder / f"laporan_healthy_gigi{manual['no_gigi']}_{manual['lokasi']}_{timestamp}.json"
-        )
-    else:
-        json_path = pdf_path.replace(".pdf", ".json")
+        json_path = str(dest_dir / f"laporan_{timestamp}.json")
 
-    with open(json_path, "w", encoding="utf-8") as f:
-        json.dump({
-            "image_path":   image_path,
-            "query":        query,
-            "contexts":     chunks,
-            "report":       report,
-            "pdf_path":     pdf_path,
-            "manual_input": manual,
-            "detection": {
-                "class_name":  detection.get("class_name"),
-                "confidence":  detection.get("confidence"),
-                "severity":    detection.get("severity"),
-            }
-        }, f, ensure_ascii=False, indent=2)
-    print(f"      JSON saved: {json_path}")
-
-    print(f"{'='*50}\n")
-    return {
-        "detection": detection,
-        "manual":    manual,
-        "query":     query,
-        "contexts":  chunks,
-        "report":    report,
-        "pdf_path":  pdf_path
+    data = {
+        "uid": uid or "",
+        "image_path": str(Path(image_path).resolve()) if image_path else "",
+        "query": query,
+        "contexts": contexts,
+        "report": report,
+        "pdf_path": pdf_path,
+        "manual_input": {
+            "patient_name": patient_name,
+            "no_gigi": tooth,
+            "lokasi": lokasi,
+        },
+        "detection": {
+            "class_name": detection.get("class_name"),
+            "confidence": detection.get("confidence"),
+            "severity": detection.get("severity"),
+        },
     }
 
-
-def generate_healthy_reports(output_folder: Path = OUTPUT_FOLDER) -> None:
-    """
-    Batch generate standard healthy control case reports and evaluation sidecars.
-
-    Args:
-        output_folder: Destination folder for output JSON sidecars.
-    """
-    output_folder.mkdir(parents=True, exist_ok=True)
-    healthy_cases = [
-        {"no_gigi": "46", "lokasi": "oklusal"},
-        {"no_gigi": "26", "lokasi": "oklusal"},
-        {"no_gigi": "14", "lokasi": "bukal"},
-        {"no_gigi": "25", "lokasi": "oklusal"},
-        {"no_gigi": "47", "lokasi": "oklusal"},
-    ]
-
-    print(f"\n{'='*50}")
-    print(f"Batch generating {len(healthy_cases)} healthy tooth reports...")
-    print(f"{'='*50}")
-
-    for i, case in enumerate(healthy_cases, 1):
-        no_gigi = case["no_gigi"]
-        lokasi  = case["lokasi"]
-        print(f"\n[{i}/{len(healthy_cases)}] Tooth {no_gigi} - {lokasi}")
-
-        report = generate_healthy_report_static(no_gigi, lokasi)
-        query  = build_query_healthy({"no_gigi": no_gigi, "lokasi": lokasi})
-
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        json_path = str(
-            output_folder / f"laporan_healthy_gigi{no_gigi}_{lokasi}_{timestamp}.json"
-        )
-        with open(json_path, "w", encoding="utf-8") as f:
-            json.dump({
-                "query":        query,
-                "contexts":     [],
-                "report":       report,
-                "manual_input": case,
-                "detection": {
-                    "class_name": None,
-                    "confidence": None,
-                    "severity":   None,
-                },
-            }, f, ensure_ascii=False, indent=2)
-        print(f"      JSON saved: {json_path}")
-
-    print(f"\n{'='*50}")
-    print(f"Done — {len(healthy_cases)} healthy reports generated.")
-    print(f"{'='*50}\n")
-
-
-if __name__ == "__main__":
-    import sys
-    if len(sys.argv) > 1 and sys.argv[1] == "--healthy":
-        generate_healthy_reports()
-    else:
-        image_path = sys.argv[1] if len(sys.argv) > 1 else "test_image.jpg"
-        run(image_path)
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    return json_path

@@ -15,7 +15,7 @@ The system analyzes transilluminated tooth images, segments caries lesions aroun
   - **Clinician-Facing**: Precise FDI tooth notation, radiometric interpretation, margin integrity assessment, and severity-tailored intervention pathways (active monitoring vs. bitewing confirmation vs. re-restoration / endodontics).
   - **Patient-Facing**: Accessible lay explanations in Indonesian, reassuring tone, and targeted daily brushing/flossing recommendations tailored to the exact tooth surface (occlusal, buccal, lingual, interproximal).
 - **Automated PDF Typesetting**: Produces professional two-page clinical reports with side-by-side original and segmented lesion overlays.
-- **Rigorous Offline Evaluation**: Built-in reference-free evaluation suites using **RAGAS** (Faithfulness, Relevancy, Precision, Recall) and **G-Eval LLM-as-a-Judge** (Coherence, Completeness, Relevance, Simplicity, Clarity).
+- **Rigorous Offline Evaluation**: Built-in reference-free evaluation suites using **RAGAS** (Faithfulness, Relevancy, Precision, Recall) and **G-Eval LLM-as-a-Judge** (Coherence, Completeness, Relevance, Simplicity, Clarity), indexed with crash-safe CSV skip-existing logic.
 - **Embedded Hardware Benchmarking**: Benchmark scripts comparing ONNX Runtime against TensorRT FP16 on NVIDIA Jetson edge devices.
 
 ---
@@ -55,20 +55,42 @@ flowchart TD
 
 ---
 
-## Directory Structure
+## Project Structure
 
 ```
-src/
-├── cdss/                           # Clinical Decision Support System & RAG
-│   ├── build_kb.py                 # PDF literature extractor, chunker & ChromaDB builder
-│   ├── report.py                   # End-to-end CDSS inference & PDF generator
-│   ├── geval.py                    # G-Eval reference-free LLM-as-a-judge evaluation
-│   ├── ragas.py                    # RAGAS-inspired reference-free evaluation suite
-│   └── knowledge_base/             # Peer-reviewed dental journal literature (PDFs)
-├── yolo/                           # Computer Vision Model Training
-│   └── train.py                    # YOLO instance segmentation training script
-└── deployment/                     # Embedded Edge Deployment & Benchmarking
-    └── jetson_inference.py         # Jetson Nano/Xavier/Orin ONNX vs. TensorRT benchmark
+transaid/
+├── .env                      # Local environment configuration (copied from .env.example)
+├── .env.example              # Environment template
+├── README.md                 # Project documentation
+├── main.py                   # Single entry point (generation + evaluation)
+├── pimnas/                   # Archived legacy GUI + SQLite version
+└── src/
+    ├── cdss/                 # Clinical Decision Support System & RAG
+    │   ├── build_kb.py       # PDF literature extractor, chunker & ChromaDB builder
+    │   ├── report.py         # RAG retrieval, clinical LLM synthesis & PDF typesetting library
+    │   ├── geval.py          # G-Eval reference-free LLM-as-a-judge evaluation suite
+    │   ├── ragas.py          # RAGAS-inspired reference-free evaluation suite
+    │   └── knowledge_base/   # Peer-reviewed dental journal literature (PDFs)
+    ├── yolo/                 # Computer Vision & Instance Segmentation
+    │   ├── train.py          # YOLO instance segmentation training script
+    │   └── yolo_inference.py # YOLO model loader, inference & severity classifier
+    ├── deployment/           # Embedded Edge Deployment & Benchmarking
+    │   └── jetson_inference.py # Jetson Nano/Xavier/Orin ONNX vs. TensorRT benchmark
+    └── outputs/              # Generated outputs (resolved via OUTPUT_DIR)
+        ├── healthy/          # Sessions where no caries was detected
+        │   ├── <uid>.pdf          # Typeset clinical report
+        │   ├── <uid>.png          # YOLO segmentation overlay
+        │   ├── <uid>.json         # Full structured case data (evaluation input)
+        │   ├── <uid>_geval.json   # Per-session G-Eval scores & reasoning
+        │   └── <uid>_ragas.json   # Per-session RAGAS scores & reasoning
+        ├── caries/           # Sessions where caries lesion was detected
+        │   ├── <uid>.pdf
+        │   ├── <uid>.png
+        │   ├── <uid>.json
+        │   ├── <uid>_geval.json
+        │   └── <uid>_ragas.json
+        ├── geval.csv         # Aggregate G-Eval scores across all sessions
+        └── ragas.csv         # Aggregate RAGAS scores across all sessions
 ```
 
 ---
@@ -77,7 +99,7 @@ src/
 
 ### 1. Prerequisites
 - Python 3.10 or higher
-- NVIDIA GPU with CUDA support (recommended for YOLO training & local LLM inference)
+- NVIDIA GPU with CUDA support (recommended for YOLO inference/training & local LLM execution)
 - [Ollama](https://ollama.ai/) installed and running locally
 
 ### 2. Install Python Dependencies
@@ -85,7 +107,7 @@ src/
 ```bash
 pip install ultralytics torch torchvision torchaudio \
     chromadb sentence-transformers nltk pypdf fpdf2 \
-    openai pillow requests numpy
+    openai pillow requests numpy python-dotenv
 ```
 
 ### 3. Pull Ollama LLM Models
@@ -99,11 +121,13 @@ ollama pull qwen3:14b
 
 ### 4. Configure Environment Variables
 
-Copy `.env.example` in the project root to `.env` and adjust paths as needed:
+Copy `.env.example` in the project root to `.env`:
 
 ```bash
 cp .env.example .env
 ```
+
+Environment variables are loaded automatically via `python-dotenv`:
 
 | Variable | Default | Description |
 | :--- | :--- | :--- |
@@ -115,9 +139,7 @@ cp .env.example .env
 | `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama HTTP endpoint |
 | `LLM_MODEL` | `gemma3:12b` | Clinical generation LLM |
 | `JUDGE_MODEL` | `qwen3:14b` | Evaluation LLM for G-Eval and RAGAS |
-| `CDSS_OUTPUT_DIR` | `src/cdss/outputs/reports` | Output directory for generated PDF and JSON reports |
-| `GEVAL_OUTPUT_DIR` | `src/cdss/outputs/geval` | Output directory for G-Eval evaluation scores |
-| `RAGAS_OUTPUT_DIR` | `src/cdss/outputs/ragas` | Output directory for RAGAS evaluation scores |
+| `OUTPUT_DIR` | `src/outputs` | Root output directory (`healthy/`, `caries/`, `geval.csv`, `ragas.csv`) |
 
 ---
 
@@ -146,57 +168,109 @@ python src/cdss/build_kb.py
 - Applies sentence-aware sliding window chunking (target: 150 words, overlap: 30 words) with NLTK.
 - Encodes passages into 768-dimensional biomedical vector embeddings via `NeuML/pubmedbert-base-embeddings`.
 
-### Step 3: Run the CDSS Reporting Pipeline
+### Step 3: Run the Main CDSS Pipeline
 
-Run the end-to-end pipeline on an input NILT dental image:
+`main.py` is the unified entry point for report generation and evaluation.
 
-```bash
-python src/cdss/report.py path/to/nilt_image.jpg
-```
-
-**Interactive Prompts:**
-1. Enter the tooth number in FDI notation (e.g., `36`, `15`, `46`).
-2. Enter the lesion location / surface (e.g., `oklusal`, `mesial`, `distal`, `bukal`, `servikal`).
-
-**Output:**
-- Side-by-side segmentation visualization (`yolo_result.jpg`).
-- Structured multi-page clinical PDF report (`laporan_<timestamp>.pdf`).
-- Evaluation sidecar JSON (`laporan_<timestamp>.json`).
-
-#### Batch Healthy Control Cases:
-To generate reports for healthy control cases (cases with no detected caries):
+#### 1. Full Pipeline (Interactive Mode)
+Runs YOLO inference -> generates report -> runs G-Eval -> runs RAGAS:
 
 ```bash
-python src/cdss/report.py --healthy
+python main.py path/to/nilt_image.jpg
 ```
 
-### Step 4: Quality Evaluation (RAGAS & G-Eval)
+You will be prompted interactively for:
+1. **Patient name**: Name of the patient (e.g. `Liza`).
+2. **Tooth number**: FDI notation (e.g. `36`, `15`, `46`).
+3. **Lesion surface / location**: Surface inspected (`oklusal`, `mesial`, `distal`, `bukal`, `lingual`, `servikal`).
 
-Evaluate all generated reports stored in the output folder:
-
-#### RAGAS Metric Suite:
-Evaluates clinician reports against four reference-free dimensions:
-- **Faithfulness**: Verifies claims against literature or established dental knowledge.
-- **Answer Relevancy**: Checks coverage of tooth, surface, and severity.
-- **Context Precision**: Rates the clinical usefulness of retrieved literature.
-- **Context Recall**: Verifies whether essential clinical concepts were retrieved.
+#### 2. Full Pipeline (Scriptable / Non-Interactive Mode)
+Pass `--name`, `--tooth`, and `--lokasi` to bypass interactive prompts:
 
 ```bash
-python src/cdss/ragas.py
+python main.py path/to/nilt_image.jpg --name Liza --tooth 36 --lokasi oklusal
 ```
+
+> [!NOTE]
+> All three flags (`--name`, `--tooth`, `--lokasi`) must be provided together when running non-interactively.
+
+#### 3. Report Generation Only (Skip Evaluation)
+Decouple report generation from evaluation with `--skip-eval`:
+
+```bash
+python main.py path/to/nilt_image.jpg --skip-eval
+python main.py path/to/nilt_image.jpg --name Liza --tooth 36 --lokasi oklusal --skip-eval
+```
+
+---
+
+## Session UID Scheme & Output Organization
+
+Each session receives a standardized unique identifier generated at session start:
+
+```
+<name>_<tooth>_<timestamp>
+```
+
+- **`name`**: Patient name, lowercased and slugified (non-alphanumeric characters collapsed to `_`). E.g., `Liza` -> `liza`, `Dr. John Doe` -> `dr_john_doe`.
+- **`tooth`**: Two-digit FDI tooth number (e.g. `36`).
+- **`timestamp`**: 14-digit timestamp in `YYYYMMDDHHMMSS` format (e.g. `20260917143210`).
+
+Example UID: `liza_36_20260917143210`
+
+### Automatic Output Categorization
+Outputs are organized by clinical finding based directly on YOLO detection results:
+- **`outputs/healthy/`**: Real patient cases where YOLO detected no lesion (`class_name is None`). Synthesizes deterministic healthy report and oral hygiene recommendations without requiring LLM generation.
+- **`outputs/caries/`**: Cases where a caries lesion was detected. Retrieves literature via cross-lingual RAG and generates LLM reports.
+
+Generated files per session:
+- `<uid>.png`: YOLO instance segmentation overlay mask.
+- `<uid>.pdf`: Professional two-page typeset PDF report.
+- `<uid>.json`: Structured case metadata (input to evaluation suites).
+- `<uid>_geval.json`: G-Eval per-criterion evaluation scores and reasoning.
+- `<uid>_ragas.json`: RAGAS per-metric evaluation scores and reasoning.
+
+---
+
+## Evaluation Suites (G-Eval & RAGAS)
+
+Run offline evaluations against existing reports in `outputs/healthy/` and `outputs/caries/`:
+
+```bash
+# Run both evaluation suites on all un-evaluated reports
+python main.py --geval --ragas
+
+# Run G-Eval only
+python main.py --geval
+
+# Run RAGAS only
+python main.py --ragas
+
+# Filter evaluation by patient UID prefix (case-insensitive)
+python main.py --geval --patient-id liza
+python main.py --ragas --patient-id liza_36
+python main.py --geval --ragas --patient-id liza_36_20260917
+```
+
+### Skip-Existing & Crash Safety
+- **Aggregate CSV Index**: `outputs/geval.csv` and `outputs/ragas.csv` serve as the in-memory skip index. UIDs already present in the CSV are skipped on subsequent runs.
+- **Crash-Safe Write Order**: Evaluators write the `<uid>_geval.json` / `<uid>_ragas.json` sidecar first, and append rows to the CSV last. If a run is interrupted mid-way, partial evaluations are safely reprocessed.
+
+### Metrics Evaluated
 
 #### G-Eval LLM-as-a-Judge Suite:
-Evaluates both clinician and patient reports using chain-of-thought rubrics:
 - **Dentist Report**: Coherence, Completeness, Relevance, Fluency (1–5 scale).
 - **Patient Report**: Simplicity, Clarity, Fluency, Conciseness (1–5 scale).
 
-```bash
-python src/cdss/geval.py
-```
+#### RAGAS Metric Suite:
+- **Faithfulness**: Verifies claims against literature or established dental knowledge.
+- **Answer Relevancy**: Checks coverage of tooth, surface, and severity.
+- **Context Precision**: Rates the clinical usefulness of retrieved literature (skipped for healthy cases by design).
+- **Context Recall**: Verifies whether essential clinical concepts were retrieved (skipped for healthy cases by design).
 
-Results are saved as individual JSON sidecars (`<report_id>_geval.json`) and aggregated into `geval_scores.csv`.
+---
 
-### Step 5: Hardware Benchmarking on NVIDIA Jetson
+## Hardware Benchmarking on NVIDIA Jetson
 
 To benchmark inference speed on embedded NVIDIA Jetson platforms:
 

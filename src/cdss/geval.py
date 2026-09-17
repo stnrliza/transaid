@@ -10,10 +10,15 @@ Follows the G-Eval form-filling paradigm (Liu et al., 2023). Each evaluation
 criterion defines a rubric with explicit chain-of-thought steps. A judge LLM
 (e.g., Qwen3:14b via local Ollama) scores each criterion from 1 to 5 and produces
 justification reasoning.
+
+I/O & Skip Architecture:
+- Discovers reports under outputs/healthy/ and outputs/caries/ (ignoring sidecars).
+- Reads outputs/geval.csv once to build an in-memory set of already evaluated UIDs.
+- Writes <uid>_geval.json sidecar first, then appends to outputs/geval.csv (crash safety).
 """
 
+import argparse
 import csv
-import glob
 import json
 import os
 import random
@@ -25,16 +30,25 @@ from pathlib import Path
 from typing import Optional
 
 import requests
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # ── CONFIGURATION & ENVIRONMENT ─────────────────────
 BASE_DIR            = Path(__file__).resolve().parent
+REPO_ROOT           = BASE_DIR.parent.parent
 OLLAMA_BASE_URL     = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 JUDGE_MODEL         = os.getenv("JUDGE_MODEL", "qwen3:14b")
-INPUT_DIR           = Path(os.getenv("GEVAL_INPUT_DIR", str(BASE_DIR / "outputs" / "reports")))
-OUTPUT_DIR          = Path(os.getenv("GEVAL_OUTPUT_DIR", str(BASE_DIR / "outputs" / "geval")))
-REPORT_PATTERN      = os.getenv("REPORT_PATTERN", "laporan_*.json")
+
+_output_dir_env     = os.getenv("OUTPUT_DIR", os.getenv("GEVAL_OUTPUT_DIR", "src/outputs"))
+OUTPUT_DIR          = Path(_output_dir_env)
+if not OUTPUT_DIR.is_absolute():
+    OUTPUT_DIR      = REPO_ROOT / OUTPUT_DIR
+
 SLEEP_BETWEEN_CALLS = float(os.getenv("SLEEP_BETWEEN_CALLS", "1.0"))
 SKIP_EXISTING       = os.getenv("SKIP_EXISTING", "True").lower() in ("true", "1", "yes")
+
+CSV_FIELDNAMES      = ["uid", "doc_type", "criterion", "score", "reasoning"]
 # ────────────────────────────────────────────────────
 
 
@@ -426,14 +440,15 @@ def load_report(path: str) -> dict:
         return json.load(f)
 
 
-def evaluate_report(report: dict, report_id: str, model: str, base_url: str,
-                    sleep_between_calls: float) -> dict:
+def evaluate_report(report: dict, report_id: str, model: str = JUDGE_MODEL,
+                    base_url: str = OLLAMA_BASE_URL,
+                    sleep_between_calls: float = SLEEP_BETWEEN_CALLS) -> dict:
     """
     Run full G-Eval evaluation suite across all dentist and patient criteria for one report.
 
     Args:
         report: Parsed clinical report dictionary.
-        report_id: Report identifier string.
+        report_id: Report identifier string (UID).
         model: Ollama judge model name.
         base_url: Ollama server endpoint.
         sleep_between_calls: Delay in seconds between successive evaluation calls.
@@ -447,7 +462,7 @@ def evaluate_report(report: dict, report_id: str, model: str, base_url: str,
     lokasi = manual.get("lokasi", "")
     severity = report.get("detection", {}).get("severity", "")
 
-    result = {"report_id": report_id, "dokter": {}, "pasien": {}}
+    result = {"uid": report_id, "report_id": report_id, "dokter": {}, "pasien": {}}
 
     dokter_text = assemble_dokter_text(report)
     for crit in DOKTER_CRITERIA:
@@ -472,121 +487,204 @@ def evaluate_report(report: dict, report_id: str, model: str, base_url: str,
     return result
 
 
-def write_sidecar(result: dict, output_dir: Path, report_id: str) -> str:
+def find_reports(output_dir: Path, patient_id_prefix: Optional[str] = None) -> list[Path]:
     """
-    Save evaluation result dictionary to a JSON sidecar file.
+    Discover all candidate report JSON files under output_dir (healthy/ and caries/).
+
+    Excludes per-report evaluation sidecars (*_geval.json, *_ragas.json).
+    Optionally filters by patient_id prefix (case-insensitive).
 
     Args:
-        result: Evaluation scores and reasoning dictionary.
-        output_dir: Destination output directory.
-        report_id: Base identifier for report file.
+        output_dir: Root output directory.
+        patient_id_prefix: Optional UID prefix filter.
 
     Returns:
-        Path string to written sidecar JSON.
+        Sorted list of candidate Path objects.
     """
-    output_dir.mkdir(parents=True, exist_ok=True)
-    out_path = str(output_dir / f"{report_id}_geval.json")
-    with open(out_path, "w", encoding="utf-8") as f:
-        json.dump(result, f, ensure_ascii=False, indent=2)
-    return out_path
+    subdirs = [output_dir / "healthy", output_dir / "caries"]
+    candidates: list[Path] = []
+
+    for d in subdirs:
+        if d.exists() and d.is_dir():
+            for p in d.glob("*.json"):
+                if not (p.name.endswith("_geval.json") or p.name.endswith("_ragas.json")):
+                    candidates.append(p)
+
+    # Also search directly in output_dir if no subdirectories or to support flat layouts
+    if not candidates and output_dir.exists() and output_dir.is_dir():
+        for p in output_dir.glob("*.json"):
+            if not (p.name.endswith("_geval.json") or p.name.endswith("_ragas.json")):
+                candidates.append(p)
+
+    candidates = sorted(set(candidates))
+
+    if patient_id_prefix:
+        prefix_norm = patient_id_prefix.lower()
+        candidates = [p for p in candidates if p.stem.lower().startswith(prefix_norm)]
+
+    return candidates
+
+
+def get_evaluated_uids(csv_path: Path) -> set[str]:
+    """
+    Read the aggregate CSV once and return the set of already evaluated UIDs.
+
+    Args:
+        csv_path: Path to geval.csv.
+
+    Returns:
+        Set of UIDs already present in the CSV.
+    """
+    evaluated: set[str] = set()
+    if csv_path.exists() and csv_path.stat().st_size > 0:
+        with open(csv_path, "r", encoding="utf-8", newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                uid = row.get("uid") or row.get("report_id")
+                if uid:
+                    evaluated.add(uid.strip())
+    return evaluated
 
 
 def append_to_csv_rows(result: dict, rows: list[dict]) -> None:
     """
-    Flatten hierarchical evaluation results and append row records for CSV export.
+    Flatten hierarchical evaluation results into row records for CSV export.
 
     Args:
         result: Structured evaluation result dictionary.
-        rows: Destination list of row dictionaries.
+        rows: Destination list for row records.
     """
+    uid = result.get("uid") or result.get("report_id", "")
     for doc_type in ("dokter", "pasien"):
-        for criterion, payload in result[doc_type].items():
+        for criterion, payload in result.get(doc_type, {}).items():
             rows.append({
-                "report_id": result["report_id"],
+                "uid": uid,
                 "doc_type": doc_type,
                 "criterion": criterion,
-                "score": payload["score"],
-                "reasoning": payload["reasoning"],
+                "score": payload.get("score"),
+                "reasoning": payload.get("reasoning", ""),
             })
 
 
-def write_aggregate_csv(rows: list[dict], output_dir: Path) -> str:
+def append_csv_rows(csv_path: Path, rows: list[dict]) -> None:
     """
-    Write all collected evaluation records into an aggregate CSV spreadsheet.
+    Append formatted rows to the aggregate CSV file, initializing with headers if new.
 
     Args:
-        rows: List of row dictionaries.
-        output_dir: Destination output directory.
-
-    Returns:
-        Path string to written CSV file.
+        csv_path: Path to target CSV file.
+        rows: Rows to append.
     """
-    output_dir.mkdir(parents=True, exist_ok=True)
-    out_path = str(output_dir / "geval_scores.csv")
-    fieldnames = ["report_id", "doc_type", "criterion", "score", "reasoning"]
-    with open(out_path, "w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    file_exists = csv_path.exists() and csv_path.stat().st_size > 0
+    with open(csv_path, "a", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=CSV_FIELDNAMES)
+        if not file_exists:
+            writer.writeheader()
         writer.writerows(rows)
-    return out_path
 
 
-def main():
+def check_ollama(model: str = JUDGE_MODEL, base_url: str = OLLAMA_BASE_URL) -> None:
     """
-    Orchestrate batch G-Eval evaluation across all target clinical report sidecars.
+    Verify network connectivity and judge model presence on local Ollama server.
     """
-    # Connectivity check with Ollama
     try:
-        r = requests.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=5)
+        r = requests.get(f"{base_url}/api/tags", timeout=5)
         r.raise_for_status()
         models = [m["name"] for m in r.json().get("models", [])]
-        if not any(JUDGE_MODEL in m for m in models):
-            print(f"WARNING: model '{JUDGE_MODEL}' not found in Ollama. "
+        if not any(model in m for m in models):
+            print(f"WARNING: model '{model}' not found in Ollama. "
                   f"Available: {models}. Will attempt to pull on first call.",
                   file=sys.stderr)
         else:
-            print(f"Using Ollama judge model: {JUDGE_MODEL}")
+            print(f"Using Ollama judge model: {model}")
     except requests.RequestException as e:
-        print(f"ERROR: cannot reach Ollama at {OLLAMA_BASE_URL}: {e}",
-              file=sys.stderr)
+        print(f"ERROR: cannot reach Ollama at {base_url}: {e}", file=sys.stderr)
         print("Ensure 'ollama serve' is running.", file=sys.stderr)
         sys.exit(1)
 
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    paths = sorted(glob.glob(str(INPUT_DIR / REPORT_PATTERN)))
-    if not paths:
-        print(f"No files matched '{REPORT_PATTERN}' in {INPUT_DIR}", file=sys.stderr)
-        sys.exit(1)
+def run_geval(output_dir: Optional[Path] = None,
+              patient_id: Optional[str] = None,
+              model: str = JUDGE_MODEL,
+              base_url: str = OLLAMA_BASE_URL,
+              sleep_between_calls: float = SLEEP_BETWEEN_CALLS) -> list[str]:
+    """
+    Run G-Eval evaluation suite across all matching clinical reports.
 
-    print(f"Found {len(paths)} report(s) in {INPUT_DIR}")
-    all_rows: list[dict] = []
+    Uses outputs/geval.csv as the skip-existing index.
+    Writes <uid>_geval.json sidecar first, then appends to outputs/geval.csv.
 
-    for path in paths:
-        report_id = os.path.splitext(os.path.basename(path))[0]
-        sidecar_path = OUTPUT_DIR / f"{report_id}_geval.json"
+    Args:
+        output_dir: Destination root directory containing healthy/ and caries/.
+        patient_id: Optional UID prefix filter.
+        model: Judge LLM model identifier.
+        base_url: Ollama base endpoint URL.
+        sleep_between_calls: Delay in seconds between evaluation calls.
 
-        if SKIP_EXISTING and sidecar_path.exists():
-            print(f"[skip] {report_id} (sidecar exists)")
-            with open(sidecar_path, "r", encoding="utf-8") as f:
-                result = json.load(f)
-            append_to_csv_rows(result, all_rows)
+    Returns:
+        List of UIDs evaluated in this execution.
+    """
+    target_dir = Path(output_dir) if output_dir is not None else OUTPUT_DIR
+    target_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = target_dir / "geval.csv"
+
+    check_ollama(model=model, base_url=base_url)
+
+    report_paths = find_reports(target_dir, patient_id_prefix=patient_id)
+    if not report_paths:
+        filter_msg = f" matching prefix '{patient_id}'" if patient_id else ""
+        print(f"No clinical report JSONs found in {target_dir}{filter_msg}.")
+        return []
+
+    evaluated_uids = get_evaluated_uids(csv_path) if SKIP_EXISTING else set()
+    evaluated_count = 0
+    evaluated_list: list[str] = []
+
+    print(f"Found {len(report_paths)} report(s) in {target_dir}. Already evaluated in CSV: {len(evaluated_uids)}")
+
+    for path in report_paths:
+        uid = path.stem
+        if SKIP_EXISTING and uid in evaluated_uids:
+            print(f"[skip] {uid} (already evaluated in CSV)")
             continue
 
-        print(f"[eval] {report_id}")
+        print(f"[eval] {uid}")
         try:
-            report = load_report(path)
-            result = evaluate_report(report, report_id, JUDGE_MODEL,
-                                     OLLAMA_BASE_URL, SLEEP_BETWEEN_CALLS)
-            write_sidecar(result, OUTPUT_DIR, report_id)
-            append_to_csv_rows(result, all_rows)
+            report_data = load_report(str(path))
+            result = evaluate_report(report_data, uid, model, base_url, sleep_between_calls)
+
+            # Crash-safety write order: 1. write sidecar JSON, 2. append CSV row
+            sidecar_path = path.parent / f"{uid}_geval.json"
+            with open(sidecar_path, "w", encoding="utf-8") as f:
+                json.dump(result, f, ensure_ascii=False, indent=2)
+
+            rows: list[dict] = []
+            append_to_csv_rows(result, rows)
+            append_csv_rows(csv_path, rows)
+
+            evaluated_uids.add(uid)
+            evaluated_list.append(uid)
+            evaluated_count += 1
         except Exception as e:
-            print(f"  [FAILED] {report_id}: {e}", file=sys.stderr)
+            print(f"  [FAILED] {uid}: {e}", file=sys.stderr)
             continue
 
-    csv_path = write_aggregate_csv(all_rows, OUTPUT_DIR)
-    print(f"\nDone. Aggregate CSV: {csv_path}")
-    print(f"Sidecar JSONs written to: {OUTPUT_DIR}")
+    print(f"\nG-Eval completed. {evaluated_count} report(s) evaluated.")
+    print(f"Aggregate CSV: {csv_path}")
+    return evaluated_list
+
+
+def main():
+    """CLI entry point for standalone G-Eval execution."""
+    parser = argparse.ArgumentParser(description="Run G-Eval reference-free evaluation suite.")
+    parser.add_argument("--patient-id", type=str, default=None,
+                        help="Optional UID prefix filter (e.g. 'liza' or 'liza_36')")
+    parser.add_argument("--output-dir", type=str, default=None,
+                        help="Root output directory (defaults to OUTPUT_DIR env var)")
+    args = parser.parse_args()
+
+    out_dir = Path(args.output_dir) if args.output_dir else OUTPUT_DIR
+    run_geval(output_dir=out_dir, patient_id=args.patient_id)
 
 
 if __name__ == "__main__":
