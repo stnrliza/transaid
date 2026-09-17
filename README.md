@@ -59,7 +59,6 @@ flowchart TD
 
 ```
 transaid/
-├── .env                      # Local environment configuration (copied from .env.example)
 ├── .env.example              # Environment template
 ├── README.md                 # Project documentation
 ├── main.py                   # Single entry point (generation + evaluation)
